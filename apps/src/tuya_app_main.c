@@ -341,20 +341,6 @@ STATIC OPERATE_RET __soc_dev_net_status_cb(VOID *data)
     return OPRT_OK;
 }
 
-/**
- * @brief Event handler for EVENT_RESET. Not subscribed by default - the reboot on unbind is
- * driven by iot_cbs.gw_reset_cb (__soc_dev_reset_inform_cb) instead, which the SDK calls
- * after it has flushed all reset data to flash. Kept for setups that prefer the event path;
- * it delegates so both paths share the same delayed, sync()'d reboot.
- * @param[in] data Cast to GW_RESET_TYPE_E (passed as void* by event system).
- * @return OPRT_OK.
- */
-STATIC OPERATE_RET __soc_dev_reset_cb(VOID *data)
-{
-    __soc_dev_reset_inform_cb((GW_RESET_TYPE_E)data);
-    return OPRT_OK;
-}
-
 /* ---------------------------------------------------------------------------
  * MF (manufacturing) UART and product-test callbacks
  * Used when authorization is burned via Tuya Cloud module tool (UUID/AUTHKEY not defined).
@@ -460,8 +446,10 @@ OPERATE_RET __soc_device_init(VOID_T)
 {
     OPERATE_RET rt = OPRT_OK;
 
-    /* Subscribe to system events so we react to reset, link and MQTT state changes. */
-    // ty_subscribe_event(EVENT_RESET, "quickstart", __soc_dev_reset_cb, SUBSCRIBE_TYPE_EMERGENCY);
+    /* Subscribe to link and MQTT state changes. Reset is deliberately NOT taken
+     * from EVENT_RESET here: the reboot on unbind runs off iot_cbs.gw_reset_cb
+     * (__soc_dev_reset_inform_cb), which the SDK calls after it has flushed the
+     * reset data to flash. Subscribing here as well would just reboot twice. */
     ty_subscribe_event(EVENT_LINK_UP, "quickstart", __soc_dev_net_status_cb, SUBSCRIBE_TYPE_NORMAL);
     ty_subscribe_event(EVENT_LINK_DOWN, "quickstart", __soc_dev_net_status_cb, SUBSCRIBE_TYPE_NORMAL);
     ty_subscribe_event(EVENT_MQTT_CONNECTED, "quickstart", __soc_dev_net_status_cb, SUBSCRIBE_TYPE_NORMAL);

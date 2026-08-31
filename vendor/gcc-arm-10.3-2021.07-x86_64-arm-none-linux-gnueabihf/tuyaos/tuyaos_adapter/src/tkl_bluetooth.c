@@ -458,7 +458,11 @@ OPERATE_RET tkl_ble_gatts_service_add(TKL_BLE_GATTS_PARAMS_T *p_service)
         le_gatt_characteristic_t *gatt_chr = NULL;
 
         gatt_svc[i].uuid = p_service_param->svc_uuid.uuid.uuid16;
-        gatt_svc[i].type = p_service_param->type;
+        /* Distinct enums, but TKL_BLE_UUID_SERVICE_* and LE_SERVICE_* are the
+         * same GATT attribute-type values (0x2800/0x2801/0x2802/0x2803), so the
+         * mapping is a straight cast. Cast explicitly to keep -Wenum-conversion
+         * quiet and to flag the assumption if either enum is ever renumbered. */
+        gatt_svc[i].type = (le_service_type_e)p_service_param->type;
         gatt_svc[i].chr_num = chr_num;
         /* Doc: Characteristic handle; service handle can mirror UUID. */
         p_service_param->handle = p_service_param->svc_uuid.uuid.uuid16;

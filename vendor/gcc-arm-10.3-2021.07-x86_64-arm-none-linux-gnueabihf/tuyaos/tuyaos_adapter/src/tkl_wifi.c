@@ -707,10 +707,6 @@ static VOID_T __wifi_flush_iface(CONST CHAR_T *ifn)
 }
 
 /**
- * @brief Flush IPv4 on STA iface (wlan0)
- * @return none
- */
-/**
  * @brief Ensure SoftAP iface wlan1 exists (board concurrent AP vif)
  * @return none
  * @note Matches ATK wifi_apmode.sh which runs hostapd on wlan1.
