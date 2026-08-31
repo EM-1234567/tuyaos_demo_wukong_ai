@@ -44,12 +44,47 @@
 #define TKL_DEF_AP_MAX_CONN  8
 #define TKL_DEF_AP_BEACON    100
 #define TKL_CONNECT_FAIL_SEC 60
+/* Don't hammer wpa with scan+reassociate every second while it is stuck. */
+#define TKL_REASSOC_MIN_SEC  5
+/* Throttle for the "wait IP" progress trace. */
+#define TKL_PROGRESS_LOG_SEC 3
 
-#define TKL_LOG(fmt, ...) do { \
-    printf("[tkl_wifi] " fmt "\n", ##__VA_ARGS__); \
-    FILE *_lf = fopen("/tmp/tkl_wifi.log", "a"); \
-    if (_lf) { fprintf(_lf, "[tkl_wifi] " fmt "\n", ##__VA_ARGS__); fclose(_lf); } \
-} while (0)
+#define TKL_WIFI_LOGFILE     "/tmp/tkl_wifi.log"
+
+/* Extra on-device probes (ping/openssl). Off by default — see __sta_post_got_ip. */
+#ifndef TKL_WIFI_DEBUG
+#define TKL_WIFI_DEBUG 0
+#endif
+
+/*
+ * The monitor thread logs once a second forever, so the old macro's
+ * fopen+fprintf+fclose per line was a permanent syscall tax. Keep one handle
+ * open instead (opened lazily, line-buffered so a crash still leaves the tail).
+ */
+static FILE *s_logf = NULL;
+
+static VOID_T tkl_log_write(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+
+    if (s_logf == NULL) {
+        s_logf = fopen(TKL_WIFI_LOGFILE, "a");
+        if (s_logf != NULL) {
+            setvbuf(s_logf, NULL, _IOLBF, 0);
+        }
+    }
+    if (s_logf != NULL) {
+        va_start(ap, fmt);
+        vfprintf(s_logf, fmt, ap);
+        va_end(ap);
+    }
+}
+
+#define TKL_LOG(fmt, ...) tkl_log_write("[tkl_wifi] " fmt "\n", ##__VA_ARGS__)
 
 /* ---------------------------------------------------------------------------
  * File scope variables
@@ -65,6 +100,26 @@ static BOOL_T            s_ap_ip_valid = FALSE;
 static time_t            s_conn_start_ts = 0;
 static BOOL_T            s_conn_fail_reported = FALSE;
 static time_t            s_dhcp_last_try = 0;
+static time_t            s_reassoc_last_try = 0;
+
+/**
+ * @brief Station status enum -> short name, so logs read as state transitions
+ *        instead of bare integers.
+ */
+static const char *__stat_name(WF_STATION_STAT_E s)
+{
+    switch (s) {
+    case WSS_IDLE:            return "IDLE";
+    case WSS_CONNECTING:      return "CONNECTING";
+    case WSS_PASSWD_WRONG:    return "PASSWD_WRONG";
+    case WSS_NO_AP_FOUND:     return "NO_AP_FOUND";
+    case WSS_CONN_FAIL:       return "CONN_FAIL";
+    case WSS_CONN_SUCCESS:    return "CONN_SUCCESS";
+    case WSS_GOT_IP:          return "GOT_IP";
+    case WSS_DHCP_FAIL:       return "DHCP_FAIL";
+    default:                  return "?";
+    }
+}
 
 /* ---------------------------------------------------------------------------
  * Forward declarations
@@ -75,7 +130,6 @@ static VOID_T __ensure_ap_iface(VOID_T);
 static VOID_T __sta_dhcp_ensure(BOOL_T force);
 static VOID_T __sta_post_got_ip(VOID_T);
 static VOID_T __sta_force_idle(VOID_T);
-static BOOL_T __sta_scan_has_ssid(CONST CHAR_T *ssid);
 static VOID_T __wpa_write_empty_conf(VOID_T);
 static VOID_T tkl_wpa_restart(VOID_T);
 static VOID_T tkl_hex_quote(char *dst, int dstsz, const UCHAR_T *src, int srclen);
@@ -83,7 +137,6 @@ static VOID_T __sta_recover_after_ap(VOID_T);
 static OPERATE_RET __sta_connect_via_conf(CONST CHAR_T *ssid, CONST CHAR_T *passwd);
 static BOOL_T __is_ap_ip(CONST CHAR_T *ip);
 static BOOL_T __ssid_is_expected(CONST CHAR_T *st);
-static BOOL_T __wpa_is_completed(CONST CHAR_T *st);
 static OPERATE_RET __resolve_ap_ip(CONST WF_AP_CFG_IF_S *cfg, NW_IP_S *out);
 OPERATE_RET tkl_wifi_stop_ap(VOID_T);
 OPERATE_RET tkl_wifi_station_disconnect(VOID_T);
@@ -118,22 +171,34 @@ static int tkl_shell(const char *cmd, char *out, int outsz)
 }
 
 /**
- * @brief Parse key=value from wpa_cli status (line-anchored)
+ * @brief Parse key=value from wpa_cli status into a caller buffer (line-anchored)
  * @param[in] text status text
  * @param[in] key field name
- * @return pointer to static value buffer, or NULL
- * @note Must match at line start only — naive strstr("ssid=") hits inside "bssid=".
+ * @param[out] val destination, always NUL-terminated when the function returns
+ * @param[in] valsz destination size
+ * @return TRUE when the key was found
+ * @note Must match at line start only — a naive strstr("ssid=") also hits
+ *       inside "bssid=".
+ * @note This used to return a pointer into a single static buffer, so any two
+ *       live results aliased each other. tkl_stat_from_status held the
+ *       "wpa_state" result across __ssid_is_expected(), which re-entered this
+ *       function for "ssid" and silently rewrote it underneath. It only
+ *       survived because every COMPLETED branch happened to return early.
  */
-static const char *tkl_kv(const char *text, const char *key)
+static BOOL_T tkl_kv(const char *text, const char *key, char *val, size_t valsz)
 {
-    static char val[128];
     const char *p;
     size_t klen;
-    int i;
+    size_t i;
 
-    if (!text || !key || key[0] == '\0') {
-        return NULL;
+    if (!val || valsz == 0) {
+        return FALSE;
     }
+    val[0] = '\0';
+    if (!text || !key || key[0] == '\0') {
+        return FALSE;
+    }
+
     klen = strlen(key);
     p = text;
     while (p && *p) {
@@ -141,18 +206,18 @@ static const char *tkl_kv(const char *text, const char *key)
             strncmp(p, key, klen) == 0 && p[klen] == '=') {
             p += klen + 1;
             i = 0;
-            while (*p && *p != '\n' && *p != '\r' && i < (int)sizeof(val) - 1) {
+            while (*p && *p != '\n' && *p != '\r' && i < valsz - 1) {
                 val[i++] = *p++;
             }
-            val[i] = 0;
-            return val;
+            val[i] = '\0';
+            return TRUE;
         }
         p = strchr(p, '\n');
         if (p) {
             p++;
         }
     }
-    return NULL;
+    return FALSE;
 }
 
 static int tkl_wpa(const char *args, char *out, int outsz)
@@ -166,6 +231,83 @@ static int tkl_wpa(const char *args, char *out, int outsz)
 static VOID_T tkl_wifi_rfkill_unblock(VOID_T)
 {
     tkl_shell("rfkill unblock wifi 2>/dev/null", NULL, 0);
+}
+
+/**
+ * @brief Wait until a process appears, polling instead of sleeping blindly.
+ * @param[in] name process name for pidof
+ * @param[in] max_ms overall budget in milliseconds
+ * @return elapsed ms on success, -1 on timeout
+ * @note SoftAP start-up sat squarely in front of BLE advertising: the SDK
+ *       brings the hotspot fully up before it touches BLE at all, so every
+ *       fixed usleep here delayed the moment the phone could see the device.
+ *       Polling costs one cheap pidof per 50ms and normally returns far sooner
+ *       than the old worst-case sleep.
+ */
+static BOOL_T __proc_running(CONST CHAR_T *name)
+{
+    CHAR_T cmd[64] = {0};
+    CHAR_T out[64] = {0};
+
+    snprintf(cmd, sizeof(cmd), "pidof %s 2>/dev/null", name);
+    return (tkl_shell(cmd, out, sizeof(out)) > 0 && out[0] != '\0') ? TRUE : FALSE;
+}
+
+static INT_T __wait_proc(CONST CHAR_T *name, INT_T max_ms)
+{
+    INT_T waited = 0;
+
+    while (waited <= max_ms) {
+        if (__proc_running(name)) {
+            return waited;
+        }
+        usleep(50 * 1000);
+        waited += 50;
+    }
+    return -1;
+}
+
+/**
+ * @brief Wait until an interface reports the given substring in `ip addr`.
+ * @param[in] ifn interface name
+ * @param[in] needle text to look for (e.g. the configured address)
+ * @param[in] max_ms overall budget in milliseconds
+ * @return elapsed ms on success, -1 on timeout
+ */
+static INT_T __wait_iface_has(CONST CHAR_T *ifn, CONST CHAR_T *needle, INT_T max_ms)
+{
+    CHAR_T cmd[128] = {0};
+    CHAR_T out[512] = {0};
+    INT_T waited = 0;
+
+    snprintf(cmd, sizeof(cmd), "ip addr show %s 2>/dev/null", ifn);
+    while (waited <= max_ms) {
+        out[0] = '\0';
+        if (tkl_shell(cmd, out, sizeof(out)) > 0 && strstr(out, needle) != NULL) {
+            return waited;
+        }
+        usleep(50 * 1000);
+        waited += 50;
+    }
+    return -1;
+}
+
+/**
+ * @brief Delete the SoftAP subnet route we actually configured.
+ * @note Both the stop-AP and the post-GOT_IP paths need this. It used to be a
+ *       hardcoded `ip route del 192.168.176.0/24` duplicated in both places, so
+ *       a cfg-supplied AP address left a stale route behind after provisioning.
+ */
+static VOID_T __ap_subnet_route_del(VOID_T)
+{
+    CHAR_T cmd[128] = {0};
+    INT_T s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+
+    if (!s_ap_ip_valid || sscanf(s_ap_ip.ip, "%d.%d.%d.%d", &s1, &s2, &s3, &s4) != 4) {
+        sscanf(TKL_DEF_AP_IP, "%d.%d.%d.%d", &s1, &s2, &s3, &s4);
+    }
+    snprintf(cmd, sizeof(cmd), "ip route del %d.%d.%d.0/24 2>/dev/null", s1, s2, s3);
+    tkl_shell(cmd, NULL, 0);
 }
 
 /**
@@ -221,18 +363,39 @@ static VOID_T tkl_wpa_ensure(VOID_T)
  */
 static VOID_T tkl_wpa_restart(VOID_T)
 {
+    INT_T w;
+
+    /*
+     * Called from __sta_force_idle(), i.e. on the SoftAP start path, which the
+     * SDK runs to completion before it touches BLE. The three fixed sleeps here
+     * used to add a flat 1s in front of advertising; wait on the actual
+     * conditions instead.
+     */
     tkl_shell("killall -q wpa_supplicant 2>/dev/null", NULL, 0);
-    usleep(300 * 1000);
+    w = 0;
+    while ((w < 1000) && __proc_running("wpa_supplicant")) {
+        usleep(50 * 1000);
+        w += 50;
+    }
     tkl_shell("rm -f /var/run/wpa_supplicant/" TKL_WLAN_IFNAME " 2>/dev/null", NULL, 0);
     tkl_shell("iw dev " TKL_WLAN_IFNAME " set type managed 2>/dev/null || "
               "iwconfig " TKL_WLAN_IFNAME " mode managed 2>/dev/null", NULL, 0);
     tkl_shell("ifconfig " TKL_WLAN_IFNAME " up 2>/dev/null", NULL, 0);
-    usleep(200 * 1000);
     __wpa_write_empty_conf();
     tkl_shell("wpa_supplicant -B -i " TKL_WLAN_IFNAME
               " -c " TKL_WPA_CONF " -D nl80211,wext >/tmp/tkl_wpa.log 2>&1",
               NULL, 0);
-    usleep(500 * 1000);
+    /* Ready means the control socket answers, not merely that time passed. */
+    w = 0;
+    while (w < 2000) {
+        CHAR_T out[64] = {0};
+        if (tkl_wpa("ping", out, sizeof(out)) > 0 && strstr(out, "PONG") != NULL) {
+            break;
+        }
+        usleep(50 * 1000);
+        w += 50;
+    }
+    TKL_LOG("wpa restarted, ctrl ready in %dms%s", w, (w >= 2000) ? " (TIMEOUT)" : "");
 }
 
 /**
@@ -356,16 +519,13 @@ static VOID_T __sta_force_idle(VOID_T)
  */
 static BOOL_T __ssid_is_expected(CONST CHAR_T *st)
 {
-    const char *cur = NULL;
+    char cur[WIFI_SSID_LEN + 1] = {0};
 
     if (s_conn_ssid[0] == '\0') {
         return TRUE;
     }
-    if (!st) {
-        return TRUE;
-    }
-    cur = tkl_kv(st, "ssid");
-    if (!cur || cur[0] == '\0') {
+    if (!tkl_kv(st, "ssid", cur, sizeof(cur)) || cur[0] == '\0') {
+        /* Empty ssid while COMPLETED is common briefly — do not block DHCP. */
         return TRUE;
     }
     if (strcmp(cur, s_conn_ssid) != 0) {
@@ -373,22 +533,6 @@ static BOOL_T __ssid_is_expected(CONST CHAR_T *st)
         return FALSE;
     }
     return TRUE;
-}
-
-/**
- * @brief TRUE when wpa reports COMPLETED (L2 associated)
- * @param[in] st wpa_cli status text
- * @return TRUE if associated
- */
-static BOOL_T __wpa_is_completed(CONST CHAR_T *st)
-{
-    const char *v = NULL;
-
-    if (!st) {
-        return FALSE;
-    }
-    v = tkl_kv(st, "wpa_state");
-    return (v && strcmp(v, "COMPLETED") == 0) ? TRUE : FALSE;
 }
 
 /**
@@ -443,7 +587,7 @@ static VOID_T __sta_post_got_ip(VOID_T)
 
     tkl_shell("killall -q hostapd dnsmasq 2>/dev/null", NULL, 0);
     tkl_shell("ip route del default dev " TKL_WLAN_AP_IFNAME " 2>/dev/null", NULL, 0);
-    tkl_shell("ip route del 192.168.176.0/24 2>/dev/null", NULL, 0);
+    __ap_subnet_route_del();
     __wifi_flush_iface(TKL_WLAN_AP_IFNAME);
     tkl_shell("ifconfig " TKL_WLAN_AP_IFNAME " down 2>/dev/null", NULL, 0);
 
@@ -481,13 +625,25 @@ static VOID_T __sta_post_got_ip(VOID_T)
 
     if (tkl_wifi_get_ip(WF_STATION, &tip) == OPRT_OK) {
         TKL_LOG("post GOT_IP ip=%s mask=%s gw=%s", tip.ip, tip.mask, tip.gw);
+    } else {
+        TKL_LOG("post GOT_IP: get_ip failed");
     }
+
+#if TKL_WIFI_DEBUG
+    /*
+     * Connectivity probe. Off by default: it fires ping x2 plus an openssl
+     * handshake at the exact moment the SDK starts activating against the
+     * cloud, competing for CPU and the freshly-acquired link on a device that
+     * has little of either. Rebuild with -DTKL_WIFI_DEBUG=1 when diagnosing
+     * "GOT_IP but activation fails".
+     */
     tkl_shell("(date; ip route; cat /etc/resolv.conf; "
               "ping -c 1 -W 2 223.5.5.5; "
               "ping -c 1 -W 2 47.116.185.69; "
               "echo | timeout 5 openssl s_client -connect 47.116.185.69:443 "
               "-servername h6-ay.iot-dns.com -tls1_2 2>&1 | "
               "head -n 20) >/tmp/tkl_route.log 2>&1 &", NULL, 0);
+#endif
 }
 
 /**
@@ -554,11 +710,6 @@ static VOID_T __wifi_flush_iface(CONST CHAR_T *ifn)
  * @brief Flush IPv4 on STA iface (wlan0)
  * @return none
  */
-static VOID_T __wifi_flush_ip(VOID_T)
-{
-    __wifi_flush_iface(TKL_WLAN_IFNAME);
-}
-
 /**
  * @brief Ensure SoftAP iface wlan1 exists (board concurrent AP vif)
  * @return none
@@ -589,14 +740,10 @@ static VOID_T __ensure_ap_iface(VOID_T)
  */
 static BOOL_T __hostapd_running(VOID_T)
 {
-    char out[64] = {0};
-    if (tkl_shell("pidof hostapd 2>/dev/null", out, sizeof(out)) > 0 && out[0] != '\0') {
+    if (__proc_running("hostapd")) {
         return TRUE;
     }
-    if (access(TKL_HOSTAPD_PID, F_OK) == 0) {
-        return TRUE;
-    }
-    return FALSE;
+    return (access(TKL_HOSTAPD_PID, F_OK) == 0) ? TRUE : FALSE;
 }
 
 /**
@@ -607,22 +754,21 @@ static BOOL_T __hostapd_running(VOID_T)
 static WF_STATION_STAT_E tkl_stat_from_status(const char *st)
 {
     NW_IP_S ip = {0};
-    const char *v = NULL;
+    char v[32] = {0};
 
     if (s_wifi_mode == WWM_SOFTAP) {
         return WSS_IDLE;
     }
 
-    if (st) {
-        v = tkl_kv(st, "wpa_state");
-    }
-    if (v) {
+    if (tkl_kv(st, "wpa_state", v, sizeof(v))) {
         if (!strcmp(v, "ASSOCIATING") || !strcmp(v, "SCANNING") ||
             !strcmp(v, "AUTHENTICATING") || !strcmp(v, "ASSOCIATED") ||
             !strcmp(v, "4WAY_HANDSHAKE") || !strcmp(v, "GROUP_HANDSHAKE")) {
             return WSS_CONNECTING;
         }
         if (!strcmp(v, "COMPLETED")) {
+            char wap_ip[20] = {0}; /* "255.255.255.255" + slack */
+
             /* Wrong AP (e.g. open Tuya-Guest) must never look like netcfg success. */
             if (!__ssid_is_expected(st)) {
                 return WSS_CONNECTING;
@@ -632,11 +778,9 @@ static WF_STATION_STAT_E tkl_stat_from_status(const char *st)
                 ip.ip[0] != '\0' && !__is_ap_ip(ip.ip)) {
                 return WSS_GOT_IP;
             }
-            if (tkl_kv(st, "ip_address")) {
-                const char *wap_ip = tkl_kv(st, "ip_address");
-                if (wap_ip && !__is_ap_ip(wap_ip)) {
-                    return WSS_GOT_IP;
-                }
+            if (tkl_kv(st, "ip_address", wap_ip, sizeof(wap_ip)) &&
+                wap_ip[0] != '\0' && !__is_ap_ip(wap_ip)) {
+                return WSS_GOT_IP;
             }
             return WSS_CONN_SUCCESS;
         }
@@ -663,88 +807,115 @@ static void *tkl_wifi_monitor(void *arg)
 {
     (void)arg;
     char st[512];
+    time_t last_progress_log = 0;
+
     while (s_mon_run) {
         if (s_wifi_mode == WWM_STATION || s_wifi_mode == WWM_STATIONAP) {
             WF_STATION_STAT_E cur = WSS_IDLE;
-            if (tkl_wpa("status", st, sizeof(st)) > 0) {
-                cur = tkl_stat_from_status(st);
-            } else {
-                cur = tkl_stat_from_status(NULL);
-            }
+            BOOL_T connecting = (s_conn_ssid[0] != '\0') && (s_conn_start_ts > 0);
+            BOOL_T ssid_ok = FALSE;
+            BOOL_T completed = FALSE;
+            char ws[32] = {0};
+            time_t now;
+
+            /*
+             * Clear every pass: the blocks below read st[] unconditionally, so
+             * a failed wpa_cli call used to leave them parsing the previous
+             * iteration's text — or uninitialised stack on the very first one.
+             */
+            st[0] = '\0';
+            (void)tkl_wpa("status", st, sizeof(st));
+            cur = tkl_stat_from_status(st[0] ? st : NULL);
+
+            /* Parse once per pass instead of re-scanning the text 4-5 times. */
+            (void)tkl_kv(st, "wpa_state", ws, sizeof(ws));
+            ssid_ok = __ssid_is_expected(st);
+            completed = (strcmp(ws, "COMPLETED") == 0) ? TRUE : FALSE;
+            now = time(NULL);
 
             /*
              * Kick DHCP once L2 is up (or still connecting to target).
              * Only skip when status clearly shows a wrong SSID.
              */
-            if (s_conn_ssid[0] != '\0' && __ssid_is_expected(st) &&
-                (cur == WSS_CONN_SUCCESS || cur == WSS_CONNECTING ||
-                 __wpa_is_completed(st))) {
+            if (s_conn_ssid[0] != '\0' && ssid_ok &&
+                (cur == WSS_CONN_SUCCESS || cur == WSS_CONNECTING || completed)) {
                 BOOL_T force_dhcp = FALSE;
-                if ((cur == WSS_CONN_SUCCESS || __wpa_is_completed(st)) &&
-                    s_conn_start_ts > 0 &&
-                    (time(NULL) - s_dhcp_last_try) >= 3) {
+                if ((cur == WSS_CONN_SUCCESS || completed) && s_conn_start_ts > 0 &&
+                    (now - s_dhcp_last_try) >= 3) {
                     force_dhcp = TRUE;
                 }
                 __sta_dhcp_ensure(force_dhcp);
             }
-            /* Field debug while waiting for GOT_IP after SoftAP handoff. */
-            if (s_conn_ssid[0] != '\0' && s_conn_start_ts > 0 &&
-                cur != WSS_GOT_IP &&
-                ((time(NULL) - s_conn_start_ts) % 3) == 0) {
-                CHAR_T ws[32] = {0}, sid[64] = {0}, fq[16] = {0};
-                const char *p;
-                NW_IP_S tip = {0};
-                CHAR_T dhcp[32] = {0};
-                p = tkl_kv(st, "wpa_state");
-                if (p) {
-                    strncpy(ws, p, sizeof(ws) - 1);
-                }
-                p = tkl_kv(st, "ssid");
-                if (p) {
-                    strncpy(sid, p, sizeof(sid) - 1);
-                }
-                p = tkl_kv(st, "freq");
-                if (p) {
-                    strncpy(fq, p, sizeof(fq) - 1);
-                }
-                (void)tkl_wifi_get_ip(WF_STATION, &tip);
-                tkl_shell("pidof udhcpc 2>/dev/null", dhcp, sizeof(dhcp));
-                TKL_LOG("wait IP cur=%d state=%s ssid=%s freq=%s ip=%s udhcpc=%s",
-                        (int)cur, ws[0] ? ws : "-", sid[0] ? sid : "-",
-                        fq[0] ? fq : "-", tip.ip[0] ? tip.ip : "-",
-                        dhcp[0] ? dhcp : "-");
-                /* SoftAP handoff often leaves INACTIVE — kick plain scan+assoc. */
-                if (!strcmp(ws, "INACTIVE") || !strcmp(ws, "DISCONNECTED")) {
-                    TKL_LOG("kick scan+reassociate for ssid=%s", s_conn_ssid);
+
+            /*
+             * Recovery, NOT debug: the SoftAP->STA handoff often parks wpa in
+             * INACTIVE/DISCONNECTED with nothing driving it forward. This used
+             * to live inside the field-debug block, so silencing the logs also
+             * silently removed the only thing that unstuck provisioning.
+             */
+            if (connecting && cur != WSS_GOT_IP &&
+                (!strcmp(ws, "INACTIVE") || !strcmp(ws, "DISCONNECTED"))) {
+                if ((now - s_reassoc_last_try) >= TKL_REASSOC_MIN_SEC) {
+                    s_reassoc_last_try = now;
+                    TKL_LOG("wpa stuck in %s -> scan+reassociate ssid=%s (%lds since connect)",
+                            ws, s_conn_ssid, (long)(now - s_conn_start_ts));
                     tkl_wpa("scan", NULL, 0);
                     tkl_wpa("reassociate", NULL, 0);
                 }
             }
+
+            /* Progress trace while waiting for GOT_IP (throttled, not modulo-timed). */
+            if (connecting && cur != WSS_GOT_IP &&
+                (now - last_progress_log) >= TKL_PROGRESS_LOG_SEC) {
+                char sid[WIFI_SSID_LEN + 1] = {0};
+                char fq[16] = {0};
+                char dhcp[32] = {0};
+                NW_IP_S tip = {0};
+
+                last_progress_log = now;
+                (void)tkl_kv(st, "ssid", sid, sizeof(sid));
+                (void)tkl_kv(st, "freq", fq, sizeof(fq));
+                (void)tkl_wifi_get_ip(WF_STATION, &tip);
+                tkl_shell("pidof udhcpc 2>/dev/null", dhcp, sizeof(dhcp));
+                dhcp[strcspn(dhcp, "\r\n")] = '\0';
+                TKL_LOG("wait IP [%lds] stat=%s wpa=%s ssid=%s freq=%s ip=%s udhcpc=%s",
+                        (long)(now - s_conn_start_ts), __stat_name(cur),
+                        ws[0] ? ws : "-", sid[0] ? sid : "-", fq[0] ? fq : "-",
+                        tip.ip[0] ? tip.ip : "-", dhcp[0] ? dhcp : "-");
+            }
+
+            if (cur != s_last_stat) {
+                TKL_LOG("station state %s -> %s%s", __stat_name(s_last_stat), __stat_name(cur),
+                        s_conn_ssid[0] ? "" : " (no target ssid)");
+            }
+
             if (cur != s_last_stat && s_wifi_cb) {
                 if (cur == WSS_GOT_IP) {
                     NW_IP_S tip = {0};
                     if (tkl_wifi_get_ip(WF_STATION, &tip) == OPRT_OK) {
-                        TKL_LOG("station GOT_IP %s", tip.ip);
+                        TKL_LOG("station GOT_IP %s after %lds -> WFE_CONNECTED", tip.ip,
+                                s_conn_start_ts > 0 ? (long)(now - s_conn_start_ts) : 0L);
                     }
                     __sta_post_got_ip();
                     s_wifi_cb(WFE_CONNECTED, NULL);
                     s_conn_fail_reported = FALSE;
                     s_conn_start_ts = 0;
                 } else if (cur == WSS_IDLE && s_last_stat >= WSS_CONNECTING) {
+                    TKL_LOG("station link lost -> WFE_DISCONNECTED");
                     s_wifi_cb(WFE_DISCONNECTED, NULL);
                 }
             }
 
             /* Report connect failure once after timeout. */
-            if (s_conn_start_ts > 0 && !s_conn_fail_reported &&
-                (cur == WSS_CONNECTING || cur == WSS_CONN_SUCCESS || cur == WSS_IDLE) &&
-                cur != WSS_GOT_IP) {
-                if ((time(NULL) - s_conn_start_ts) >= TKL_CONNECT_FAIL_SEC) {
+            if (s_conn_start_ts > 0 && !s_conn_fail_reported && cur != WSS_GOT_IP &&
+                (cur == WSS_CONNECTING || cur == WSS_CONN_SUCCESS || cur == WSS_IDLE)) {
+                if ((now - s_conn_start_ts) >= TKL_CONNECT_FAIL_SEC) {
+                    TKL_LOG("station connect timeout after %ds (stat=%s wpa=%s) -> WFE_CONNECT_FAILED",
+                            TKL_CONNECT_FAIL_SEC, __stat_name(cur), ws[0] ? ws : "-");
                     if (s_wifi_cb) {
                         s_wifi_cb(WFE_CONNECT_FAILED, NULL);
                     }
                     s_conn_fail_reported = TRUE;
-                    TKL_LOG("station connect timeout -> WFE_CONNECT_FAILED");
                 }
             }
             s_last_stat = cur;
@@ -873,12 +1044,19 @@ OPERATE_RET tkl_wifi_scan_ap(CONST SCHAR_T *ssid, AP_IF_S **ap_ary, UINT_T *num)
         ap->security = strstr(flags, "WPA2") ? WAAM_WPA2_PSK :
                        strstr(flags, "WPA")  ? WAAM_WPA_PSK  :
                        strstr(flags, "WEP")  ? WAAM_WEP      : WAAM_OPEN;
-        if (ssid == NULL || strncmp((const char *)ap->ssid, (const char *)ssid, (size_t)slen) == 0) {
+        /*
+         * Full-string compare. strncmp() limited to the *scanned* SSID length
+         * made any AP whose name is a prefix of the target match it — scanning
+         * for "MyNetwork" would accept a nearby "MyNet".
+         */
+        if (ssid == NULL || strcmp((const char *)ap->ssid, (const char *)ssid) == 0) {
             cnt++;
         }
     }
     *ap_ary = arr;
     *num = cnt;
+    TKL_LOG("scan done: %u/%d ap%s%s", cnt, lines - 1, (cnt == 1) ? "" : "s",
+            ssid ? " (filtered)" : "");
     return OPRT_OK;
 }
 
@@ -960,7 +1138,6 @@ OPERATE_RET tkl_wifi_start_ap(CONST WF_AP_CFG_IF_S *cfg)
     tkl_shell("killall -q hostapd dnsmasq 2>/dev/null", NULL, 0);
     /* eth0 link-up makes SDK prefer wired linkage during SoftAP. */
     tkl_shell("ifconfig eth0 down 2>/dev/null", NULL, 0);
-    usleep(200 * 1000);
     /*
      * SoftAP is on wlan1, but wlan0 must NOT stay associated to open APs
      * (Tuya-Guest etc.) or udhcpc will re-grab their IP and fake GOT_IP.
@@ -972,6 +1149,7 @@ OPERATE_RET tkl_wifi_start_ap(CONST WF_AP_CFG_IF_S *cfg)
         if (tkl_shell("ip link show " TKL_WLAN_AP_IFNAME " 2>/dev/null", chk, sizeof(chk)) <= 0 ||
             strstr(chk, TKL_WLAN_AP_IFNAME) == NULL) {
             TKL_LOG("%s missing, see /tmp/tkl_iw_add.log", TKL_WLAN_AP_IFNAME);
+            s_ap_ip_valid = FALSE;
             return OPRT_COM_ERROR;
         }
     }
@@ -980,6 +1158,8 @@ OPERATE_RET tkl_wifi_start_ap(CONST WF_AP_CFG_IF_S *cfg)
 
     f = fopen(TKL_HOSTAPD_CONF, "w");
     if (!f) {
+        TKL_LOG("open %s failed", TKL_HOSTAPD_CONF);
+        s_ap_ip_valid = FALSE;
         return OPRT_COM_ERROR;
     }
     fprintf(f,
@@ -1015,24 +1195,46 @@ OPERATE_RET tkl_wifi_start_ap(CONST WF_AP_CFG_IF_S *cfg)
 
     /* Match board wifi_apmode.sh: ifconfig wlan1 up then assign SoftAP IP. */
     tkl_shell("ifconfig " TKL_WLAN_AP_IFNAME " up 2>/dev/null", NULL, 0);
-    usleep(200 * 1000);
     snprintf(cmd, sizeof(cmd), "ifconfig %s %s netmask %s up",
              TKL_WLAN_AP_IFNAME, ap_ip.ip, ap_ip.mask);
     tkl_shell(cmd, NULL, 0);
-    usleep(300 * 1000);
+    /* Wait for the address to actually land rather than guessing 500ms. */
+    {
+        INT_T w = __wait_iface_has(TKL_WLAN_AP_IFNAME, ap_ip.ip, 2000);
+        if (w < 0) {
+            TKL_LOG("WARN: %s did not report %s within 2s", TKL_WLAN_AP_IFNAME, ap_ip.ip);
+        } else {
+            TKL_LOG("%s addr %s ready in %dms", TKL_WLAN_AP_IFNAME, ap_ip.ip, w);
+        }
+    }
 
     snprintf(cmd, sizeof(cmd), "hostapd -B -P %s %s >/tmp/tkl_hostapd.log 2>&1",
              TKL_HOSTAPD_PID, TKL_HOSTAPD_CONF);
     tkl_shell(cmd, NULL, 0);
-    usleep(500 * 1000);
-    if (!__hostapd_running()) {
-        TKL_LOG("hostapd failed to start, see /tmp/tkl_hostapd.log");
-        return OPRT_COM_ERROR;
+    {
+        /*
+         * Poll __hostapd_running() rather than pidof alone: it also accepts the
+         * -P pidfile, which is the "hostapd really came up" check that notes
+         * item 11 added after hostapd was seen reporting false success.
+         */
+        INT_T w = 0;
+        while ((w < 3000) && !__hostapd_running()) {
+            usleep(50 * 1000);
+            w += 50;
+        }
+        if (!__hostapd_running()) {
+            TKL_LOG("hostapd failed to start within 3s, see /tmp/tkl_hostapd.log");
+            /* wlan1 is already up holding the AP address — roll it back. */
+            tkl_wifi_stop_ap();
+            return OPRT_COM_ERROR;
+        }
+        TKL_LOG("hostapd up on %s in %dms", TKL_WLAN_AP_IFNAME, w);
     }
 
     d = fopen(TKL_DNSMASQ_CONF, "w");
     if (!d) {
-        tkl_shell("killall -q hostapd 2>/dev/null", NULL, 0);
+        TKL_LOG("open %s failed", TKL_DNSMASQ_CONF);
+        tkl_wifi_stop_ap();
         return OPRT_COM_ERROR;
     }
     /*
@@ -1052,20 +1254,24 @@ OPERATE_RET tkl_wifi_start_ap(CONST WF_AP_CFG_IF_S *cfg)
             ip_prefix, ip_prefix, ap_ip.mask,
             ap_ip.gw, ap_ip.gw);
     fclose(d);
-    tkl_shell("killall -q dnsmasq 2>/dev/null", NULL, 0);
     unlink("/tmp/tkl_dnsmasq.leases");
     /* dnsmasq daemonizes itself; match board wifi_apmode.sh style (-C). */
     tkl_shell("dnsmasq -C " TKL_DNSMASQ_CONF " >/tmp/tkl_dnsmasq.log 2>&1", NULL, 0);
-    usleep(200 * 1000);
     {
-        char dns_out[64] = {0};
-        if (tkl_shell("pidof dnsmasq 2>/dev/null", dns_out, sizeof(dns_out)) <= 0 ||
-            dns_out[0] == '\0') {
-            TKL_LOG("dnsmasq failed to start, see /tmp/tkl_dnsmasq.log");
-            /* SoftAP radio is up; still fail — App TCP needs DHCP for phone. */
+        INT_T w = __wait_proc("dnsmasq", 2000);
+        if (w < 0) {
+            TKL_LOG("dnsmasq failed to start within 2s, see /tmp/tkl_dnsmasq.log");
+            /*
+             * SoftAP radio is up but the phone would never get an IP. Tear the
+             * AP back down instead of returning an error with hostapd still
+             * beaconing a dead SmartLife-xxxx that the user can join but not use.
+             */
+            tkl_wifi_stop_ap();
             return OPRT_COM_ERROR;
         }
     }
+
+    TKL_LOG("dnsmasq up, DHCP pool %s.100-%s.200", ip_prefix, ip_prefix);
 
     s_wifi_mode = WWM_SOFTAP;
     s_last_stat = WSS_IDLE;
@@ -1087,7 +1293,7 @@ OPERATE_RET tkl_wifi_stop_ap(VOID_T)
     usleep(200 * 1000);
     /* Tear down wlan1 SoftAP only. Do NOT `iw del wlan1` — hangs RTL8733BU. */
     tkl_shell("ip route del default dev " TKL_WLAN_AP_IFNAME " 2>/dev/null", NULL, 0);
-    tkl_shell("ip route del 192.168.176.0/24 2>/dev/null", NULL, 0);
+    __ap_subnet_route_del();
     __wifi_flush_iface(TKL_WLAN_AP_IFNAME);
     tkl_shell("ifconfig " TKL_WLAN_AP_IFNAME " down 2>/dev/null", NULL, 0);
     usleep(100 * 1000);
@@ -1121,8 +1327,8 @@ OPERATE_RET tkl_wifi_get_cur_channel(UCHAR_T *chan)
     char st[256];
     *chan = 0;
     if (tkl_wpa("status", st, sizeof(st)) > 0) {
-        const char *v = tkl_kv(st, "freq");
-        if (v) {
+        char v[16] = {0};
+        if (tkl_kv(st, "freq", v, sizeof(v))) {
             int f = atoi(v);
             if (f >= 2412) {
                 *chan = (UCHAR_T)((f - 2412) / 5 + 1);
@@ -1316,8 +1522,8 @@ OPERATE_RET tkl_wifi_get_bssid(UCHAR_T *mac)
     char st[256];
     memset(mac, 0, 6);
     if (tkl_wpa("status", st, sizeof(st)) > 0) {
-        const char *v = tkl_kv(st, "bssid");
-        if (v) {
+        char v[32] = {0};
+        if (tkl_kv(st, "bssid", v, sizeof(v))) {
             sscanf(v, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx",
                    &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
         }
@@ -1385,8 +1591,10 @@ OPERATE_RET tkl_wifi_station_connect(CONST SCHAR_T *ssid, CONST SCHAR_T *passwd)
     s_conn_start_ts = time(NULL);
     s_conn_fail_reported = FALSE;
     s_dhcp_last_try = 0;
+    s_reassoc_last_try = 0;
 
-    TKL_LOG("station connect begin ssid=%s", (const char *)ssid);
+    TKL_LOG("station connect begin ssid=%s pw=%s", (const char *)ssid,
+            (passwd && passwd[0]) ? "yes" : "(open)");
 
     /*
      * SoftAP→STA handoff: stop AP, settle radio, start wpa with one conf.
@@ -1414,10 +1622,34 @@ OPERATE_RET tkl_wifi_station_connect(CONST SCHAR_T *ssid, CONST SCHAR_T *passwd)
  */
 OPERATE_RET tkl_wifi_station_disconnect(VOID_T)
 {
+    BOOL_T was_up = (s_last_stat >= WSS_CONNECTING) ? TRUE : FALSE;
+
+    TKL_LOG("station disconnect requested (was %s ssid=%s)", __stat_name(s_last_stat),
+            s_conn_ssid[0] ? s_conn_ssid : "-");
+
     s_last_stat = WSS_IDLE;
     s_conn_start_ts = 0;
+    s_conn_fail_reported = FALSE;
+    /*
+     * Clear the target too: the monitor keys its DHCP kicking off s_conn_ssid,
+     * so leaving it set kept udhcpc being relaunched for an SSID we had just
+     * deliberately dropped.
+     */
+    s_conn_ssid[0] = '\0';
+
     tkl_wpa("disconnect", NULL, 0);
-    if (s_wifi_cb) {
+    tkl_shell("killall -q udhcpc 2>/dev/null", NULL, 0);
+    /*
+     * Drop the address too. tkl_stat_from_status() falls back to "has a
+     * non-AP IP => GOT_IP" when no target SSID is set, so a lingering lease on
+     * the interface would make the very next monitor pass re-report
+     * WFE_CONNECTED right after we told the SDK the link was down.
+     */
+    __wifi_flush_iface(TKL_WLAN_IFNAME);
+
+    /* Only report a drop if we had actually been up — avoids a phantom
+     * WFE_DISCONNECTED on a disconnect issued from the idle state. */
+    if (was_up && s_wifi_cb) {
         s_wifi_cb(WFE_DISCONNECTED, NULL);
     }
     return OPRT_OK;
@@ -1436,8 +1668,8 @@ OPERATE_RET tkl_wifi_station_get_conn_ap_rssi(SCHAR_T *rssi)
     char st[256];
     *rssi = 0;
     if (tkl_wpa("status", st, sizeof(st)) > 0) {
-        const char *v = tkl_kv(st, "signal");
-        if (v) {
+        char v[16] = {0};
+        if (tkl_kv(st, "signal", v, sizeof(v))) {
             *rssi = (SCHAR_T)atoi(v);
         }
     }

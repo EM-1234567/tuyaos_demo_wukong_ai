@@ -10,7 +10,6 @@ extern "C" {
 #endif
 
 
-int tuya_gatt_register_characteristic_test(uint16_t svc_uuid);
 /**
  * @brief init gatt
  *

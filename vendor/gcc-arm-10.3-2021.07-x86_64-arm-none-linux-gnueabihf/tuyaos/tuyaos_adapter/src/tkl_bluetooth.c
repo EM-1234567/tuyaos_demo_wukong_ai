@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "tuya_cloud_types.h"
 #include "tuya_bluez_api.h"
@@ -10,10 +11,21 @@
 /* Doc sample uses a fixed connection handle; keep char handles as UUIDs. */
 #define BLE_CONN_HANDLE 0x0001
 
+/*
+ * Writes that landed before the D-Bus "Connected" edge did. Each one carries
+ * the time it was cached: a cached write only makes sense for the connection
+ * it arrived on, and if that connection's CONNECT edge never shows up (BlueZ
+ * can drop the Device1 object instead) the entry would otherwise sit in the
+ * queue and get replayed into the NEXT phone's session, corrupting the Tuya
+ * pairing handshake.
+ */
+#define BLE_CACHE_TTL_SEC 10
+
 typedef struct {
     UINT16_T uuid;
     USHORT_T length;
-    UCHAR_T data[0];
+    time_t   ts;
+    UCHAR_T  data[0];
 } BLE_CACHE_DATA_T;
 
 STATIC TKL_BLE_GAP_EVT_FUNC_CB __gap_evt_cb   = NULL;
@@ -23,6 +35,94 @@ STATIC BOOL_T g_connected          = FALSE;
 STATIC BOOL_T g_stack_inited       = FALSE;
 STATIC P_QUEUE_CLASS g_cache_queue = NULL;
 static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * @brief Hand a GATT write up to the SDK.
+ * @note Must never take g_cache_mutex — it is called both directly and from
+ *       the cache-flush path, and the mutex is not recursive.
+ */
+STATIC VOID __deliver_write_event(UINT16_T uuid, UINT8_T *data, UINT16_T len)
+{
+    TKL_BLE_GATT_PARAMS_EVT_T event;
+
+    if (__gatt_evt_cb == NULL) {
+        return;
+    }
+
+    memset(&event, 0, SIZEOF(TKL_BLE_GATT_PARAMS_EVT_T));
+    event.result = 0;
+    event.type = TKL_BLE_GATT_EVT_WRITE_REQ;
+    event.conn_handle = BLE_CONN_HANDLE;
+    event.gatt_event.write_report.char_handle = uuid;
+    event.gatt_event.write_report.report.p_data = data;
+    event.gatt_event.write_report.report.length = len;
+    __gatt_evt_cb(&event);
+}
+
+/**
+ * @brief Pop one cached write, or NULL when the queue is empty.
+ */
+STATIC BLE_CACHE_DATA_T *__cache_pop(VOID)
+{
+    BLE_CACHE_DATA_T *cache_data = NULL;
+
+    pthread_mutex_lock(&g_cache_mutex);
+    if ((g_cache_queue != NULL) && GetCurQueNum(g_cache_queue)) {
+        if (!OutQueue(g_cache_queue, (unsigned char *)&cache_data, 1)) {
+            cache_data = NULL;
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+    return cache_data;
+}
+
+/**
+ * @brief Deliver every write that arrived before the connect event landed.
+ * @note Entries are popped under the lock but dispatched outside it: the SDK
+ *       callback can re-enter this module, and the previous version called the
+ *       write handler while still holding g_cache_mutex, which self-deadlocked
+ *       on the disconnect path (g_connected == FALSE made the handler try to
+ *       re-take the same non-recursive mutex).
+ */
+STATIC VOID __cache_flush(VOID)
+{
+    BLE_CACHE_DATA_T *cache_data = NULL;
+    time_t now = time(NULL);
+    UINT_T sent = 0, stale = 0;
+
+    while ((cache_data = __cache_pop()) != NULL) {
+        if ((now - cache_data->ts) > BLE_CACHE_TTL_SEC) {
+            /* Left over from a session whose CONNECT edge never arrived. */
+            stale++;
+        } else {
+            PR_DEBUG("flush cached write: uuid=0x%04x, len=%u", cache_data->uuid,
+                     (UINT_T)cache_data->length);
+            __deliver_write_event(cache_data->uuid, cache_data->data, cache_data->length);
+            sent++;
+        }
+        Free(cache_data);
+    }
+    if (sent || stale) {
+        PR_INFO("cache flush on connect: delivered=%u dropped_stale=%u", sent, stale);
+    }
+}
+
+/**
+ * @brief Drop cached writes without delivering them (link went away).
+ */
+STATIC VOID __cache_drop(VOID)
+{
+    BLE_CACHE_DATA_T *cache_data = NULL;
+    UINT_T dropped = 0;
+
+    while ((cache_data = __cache_pop()) != NULL) {
+        Free(cache_data);
+        dropped++;
+    }
+    if (dropped > 0) {
+        PR_WARN("dropped %u cached write(s) on disconnect", dropped);
+    }
+}
 
 STATIC VOID __gatt_write_request_event_cb(UINT16_T uuid, UINT8_T *data, UINT16_T len)
 {
@@ -35,50 +135,50 @@ STATIC VOID __gatt_write_request_event_cb(UINT16_T uuid, UINT8_T *data, UINT16_T
      * before the connection event is detected. Cache data until connected.
      */
     if (!g_connected) {
-        pthread_mutex_lock(&g_cache_mutex);
         cache_data = (BLE_CACHE_DATA_T *)Malloc(SIZEOF(BLE_CACHE_DATA_T) + len);
         if (!cache_data) {
             PR_ERR("Malloc err");
-            pthread_mutex_unlock(&g_cache_mutex);
             return;
         }
         cache_data->uuid   = uuid;
         cache_data->length = len;
+        cache_data->ts     = time(NULL);
         memcpy(cache_data->data, data, len);
-        InQueue(g_cache_queue, (unsigned char *)&cache_data, 1);
+
+        pthread_mutex_lock(&g_cache_mutex);
+        if ((g_cache_queue == NULL) || !InQueue(g_cache_queue, (unsigned char *)&cache_data, 1)) {
+            pthread_mutex_unlock(&g_cache_mutex);
+            PR_ERR("cache queue full, drop write uuid=0x%04x", uuid);
+            Free(cache_data);
+            return;
+        }
         pthread_mutex_unlock(&g_cache_mutex);
         return;
     }
 
-    TKL_BLE_GATT_PARAMS_EVT_T event;
-    memset(&event, 0, SIZEOF(TKL_BLE_GATT_PARAMS_EVT_T));
-
-    event.result = 0;
-    event.type = TKL_BLE_GATT_EVT_WRITE_REQ;
-    event.conn_handle = BLE_CONN_HANDLE;
-    event.gatt_event.write_report.char_handle = uuid;
-    event.gatt_event.write_report.report.p_data = data;
-    event.gatt_event.write_report.report.length = len;
-
-    if (__gatt_evt_cb) {
-        __gatt_evt_cb(&event);
-    }
+    __deliver_write_event(uuid, data, len);
 }
 
 STATIC VOID __gap_connect_event_cb(INT_T status)
 {
-    PR_INFO("recv connect event, status: %d", status);
-    g_connected = status;
-
     TKL_BLE_GAP_PARAMS_EVT_T event;
-    memset(&event, 0, SIZEOF(TKL_BLE_GAP_PARAMS_EVT_T));
+    BOOL_T connected = (status != 0) ? TRUE : FALSE;
 
-    event.result = 0;
-    if (status) {
-        event.type = TKL_BLE_GAP_EVT_CONNECT;
-    } else {
-        event.type = TKL_BLE_GAP_EVT_DISCONNECT;
+    /*
+     * BlueZ reports the link through two properties (Connected and
+     * ServicesResolved), so the same transition arrives twice. Report only
+     * real edges to the SDK.
+     */
+    if (connected == g_connected) {
+        PR_DEBUG("ignore duplicate connect event, status: %d", status);
+        return;
     }
+    PR_INFO("recv connect event, status: %d", status);
+    g_connected = connected;
+
+    memset(&event, 0, SIZEOF(TKL_BLE_GAP_PARAMS_EVT_T));
+    event.result = 0;
+    event.type = connected ? TKL_BLE_GAP_EVT_CONNECT : TKL_BLE_GAP_EVT_DISCONNECT;
     event.conn_handle = BLE_CONN_HANDLE;
     event.gap_event.connect.role = TKL_BLE_ROLE_SERVER;
 
@@ -86,35 +186,19 @@ STATIC VOID __gap_connect_event_cb(INT_T status)
         __gap_evt_cb(&event);
     }
 
-    /**
-     * BlueZ D-BUS race: data may arrive before connection event.
-     * Flush cached data after connection is established.
-     */
-    pthread_mutex_lock(&g_cache_mutex);
-    while (GetCurQueNum(g_cache_queue)) {
-        BLE_CACHE_DATA_T *cache_data = NULL;
-        if (!OutQueue(g_cache_queue, (unsigned char *)&cache_data, 1)) {
-            break;
-        }
-        if (cache_data == NULL) {
-            break;
-        }
-        PR_DEBUG("flush cache: uuid=0x%04x, len=%d", cache_data->uuid, cache_data->length);
-        __gatt_write_request_event_cb(cache_data->uuid, cache_data->data, cache_data->length);
-        Free(cache_data);
-        cache_data = NULL;
+    /* BlueZ D-BUS race: writes can land before the connect event. */
+    if (connected) {
+        __cache_flush();
+    } else {
+        __cache_drop();
     }
-    pthread_mutex_unlock(&g_cache_mutex);
 }
 
 /**
- * Notify SDK that BLE stack initialization is complete.
- * Without this, SDK will not start advertising.
- */
-/**
- * @brief Notify SDK that BLE stack init is done (WiFi/AI SDK needs this to start adv)
- * @return none
- * @note Official gateway sample omits this; Wukong WiFi SDK requires STACK_INIT.
+ * @brief Notify the SDK that BLE stack init is done — without it the SDK never
+ *        starts advertising.
+ * @note The official gateway sample omits STACK_INIT; the Wukong Wi-Fi SDK
+ *       requires it.
  */
 STATIC VOID __gap_init_event_cb(VOID)
 {
@@ -137,10 +221,19 @@ OPERATE_RET tkl_ble_stack_init(UCHAR_T role)
     (void)role;
     PR_INFO("tkl_ble_stack_init");
 
-    g_cache_queue = CreateQueueObj(32, SIZEOF(BLE_CACHE_DATA_T));
-    if (!g_cache_queue) {
-        PR_ERR("CreateQueueObj error");
-        return OPRT_COM_ERROR;
+    if (g_cache_queue == NULL) {
+        /*
+         * The queue holds POINTERS to heap-allocated BLE_CACHE_DATA_T, so the
+         * unit size is the pointer size, not the struct size. The old code
+         * passed SIZEOF(BLE_CACHE_DATA_T) and only survived because the struct
+         * was then exactly 4 bytes, same as a pointer here — it is 12 now that
+         * entries carry a timestamp, so that bug would corrupt the queue.
+         */
+        g_cache_queue = CreateQueueObj(32, SIZEOF(BLE_CACHE_DATA_T *));
+        if (!g_cache_queue) {
+            PR_ERR("CreateQueueObj error");
+            return OPRT_COM_ERROR;
+        }
     }
 
     tuya_bluez_init();
@@ -321,11 +414,30 @@ OPERATE_RET tkl_ble_gap_adv_rsp_data_update(TKL_BLE_DATA_T CONST *p_adv, TKL_BLE
     return tkl_ble_gap_adv_rsp_data_set(p_adv, p_scan_rsp);
 }
 
+/**
+ * @brief Release the temporary le_gatt_service_t array built for the BlueZ call
+ */
+STATIC VOID __gatt_svc_array_free(le_gatt_service_t *gatt_svc, UINT8_T svc_num)
+{
+    UINT8_T i;
+
+    if (gatt_svc == NULL) {
+        return;
+    }
+    for (i = 0; i < svc_num; i++) {
+        if (gatt_svc[i].chr) {
+            Free(gatt_svc[i].chr);
+        }
+    }
+    Free(gatt_svc);
+}
+
 OPERATE_RET tkl_ble_gatts_service_add(TKL_BLE_GATTS_PARAMS_T *p_service)
 {
     INT_T i = 0, j = 0;
     UINT8_T svc_num             = 0;
     le_gatt_service_t *gatt_svc = NULL;
+    OPERATE_RET rt              = OPRT_OK;
 
     if ((p_service == NULL) || (p_service->p_service == NULL) || (p_service->svc_num == 0)) {
         return OPRT_INVALID_PARM;
@@ -342,24 +454,27 @@ OPERATE_RET tkl_ble_gatts_service_add(TKL_BLE_GATTS_PARAMS_T *p_service)
 
     for (i = 0; i < svc_num; i++) {
         TKL_BLE_SERVICE_PARAMS_T *p_service_param = &p_service->p_service[i];
+        UINT8_T chr_num = p_service_param->char_num;
+        le_gatt_characteristic_t *gatt_chr = NULL;
 
         gatt_svc[i].uuid = p_service_param->svc_uuid.uuid.uuid16;
         gatt_svc[i].type = p_service_param->type;
-        gatt_svc[i].chr_num = p_service_param->char_num;
+        gatt_svc[i].chr_num = chr_num;
         /* Doc: Characteristic handle; service handle can mirror UUID. */
         p_service_param->handle = p_service_param->svc_uuid.uuid.uuid16;
 
-        PR_DEBUG("service uuid: 0x%04x, char_num: %u", gatt_svc[i].uuid, gatt_svc[i].chr_num);
+        PR_DEBUG("service uuid: 0x%04x, char_num: %u", gatt_svc[i].uuid, chr_num);
 
-        UINT8_T chr_num                    = p_service_param->char_num;
-        le_gatt_characteristic_t *gatt_chr = (le_gatt_characteristic_t *)Malloc(chr_num * SIZEOF(le_gatt_characteristic_t));
+        gatt_chr = (le_gatt_characteristic_t *)Malloc(chr_num * SIZEOF(le_gatt_characteristic_t));
         if (!gatt_chr) {
-            Free(gatt_svc);
+            /* Free the chr arrays already attached to gatt_svc[0..i-1] too. */
+            __gatt_svc_array_free(gatt_svc, svc_num);
             return OPRT_MALLOC_FAILED;
         }
         memset(gatt_chr, 0, chr_num * SIZEOF(le_gatt_characteristic_t));
+        gatt_svc[i].chr = gatt_chr;
 
-        for (j = 0; j < gatt_svc[i].chr_num; j++) {
+        for (j = 0; j < chr_num; j++) {
             USHORT_T handle = __tkl_uuid_to_handle(&p_service_param->p_char[j].char_uuid);
 
             /*
@@ -373,29 +488,15 @@ OPERATE_RET tkl_ble_gatts_service_add(TKL_BLE_GATTS_PARAMS_T *p_service)
             PR_INFO("chr[%d] uuid: %s, handle: 0x%04x, props: 0x%02x", j, gatt_chr[j].uuid, handle,
                     gatt_chr[j].property);
         }
-
-        gatt_svc[i].chr = gatt_chr;
     }
 
     if (tuya_bluez_le_add_gatt_service(gatt_svc, svc_num) != 0) {
-        for (i = 0; i < svc_num; i++) {
-            if (gatt_svc[i].chr) {
-                Free(gatt_svc[i].chr);
-            }
-        }
-        Free(gatt_svc);
         PR_ERR("tuya_bluez_le_add_gatt_service failed");
-        return OPRT_COM_ERROR;
+        rt = OPRT_COM_ERROR;
     }
 
-    for (i = 0; i < svc_num; i++) {
-        if (gatt_svc[i].chr) {
-            Free(gatt_svc[i].chr);
-        }
-    }
-    Free(gatt_svc);
-
-    return OPRT_OK;
+    __gatt_svc_array_free(gatt_svc, svc_num);
+    return rt;
 }
 
 
@@ -550,11 +651,6 @@ OPERATE_RET tkl_ble_vendor_command_control(USHORT_T opcode, VOID_T *user_data, U
 
     return OPRT_NOT_SUPPORTED;
 }
-
-void rend_bt_data(uint8_t len, uint8_t *buffer)
-{
-}
-
 
 /* ---------------------------------------------------------------------------
  * Stubs required by public TKL header (peripheral provisioning path unused)

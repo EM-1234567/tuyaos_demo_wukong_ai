@@ -1,3 +1,15 @@
+/**
+ * @file tuya_bluez_api.c
+ * @brief Bridge between the TKL BLE layer and the two stacks this board uses.
+ *
+ * Split of responsibilities (do not "unify" these — see BLE_NETCFG_NOTES.md):
+ *   - Advertising: raw legacy HCI (tuya_hci.c). BlueZ LEAdvertisingManager1
+ *     registers fine on RTL8733BU but the controller never airs the packets,
+ *     and registering it makes mgmt claim advertising, after which raw HCI
+ *     LE Set Adv is rejected with 0x0C Command Disallowed. So we deliberately
+ *     never register a BlueZ advertisement, which keeps mgmt adv-free.
+ *   - GATT: BlueZ D-Bus GattManager1 (tuya_gatt.c).
+ */
 #include <glib.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -7,112 +19,71 @@
 #include "tuya_bluez_compat.h"
 
 #include "tuya_bluez_api.h"
-#include "tuya_adv.h"
 #include "tuya_hci.h"
 #include "tuya_gatt.h"
+
+/*
+ * Field diagnostics. Off by default: the dump forks 4-5 short-lived processes
+ * (pidof / hciconfig / dbus-send / ps) every time it runs, which is pure cost
+ * on the provisioning path. Rebuild with -DTUYA_BLE_DEBUG=1 to get it back.
+ */
+#ifndef TUYA_BLE_DEBUG
+#define TUYA_BLE_DEBUG 0
+#endif
 
 static int g_bluez_inited = FALSE;
 static GMainLoop *main_loop;
 
+#if TUYA_BLE_DEBUG
 /**
- * @brief Dump host BLE/DBus environment into ble_diag log
+ * @brief Dump host BLE/D-Bus environment (dbus, bluetoothd, hci0, BlueZ ifaces)
  * @param[in] tag caller context string
- * @return none
  */
 static void __ble_env_dump(const char *tag)
 {
+    static const char *const probes[] = {
+        "pidof dbus-daemon 2>/dev/null",
+        "pidof bluetoothd 2>/dev/null",
+        "hciconfig hci0 2>/dev/null | head -6",
+        "dbus-send --system --print-reply --dest=org.bluez /org/bluez/hci0 "
+        "org.freedesktop.DBus.Introspectable.Introspect 2>/dev/null "
+        "| tr '<>' '\\n' | grep -E 'LEAdvertising|Adapter1|GattManager' | head -12",
+    };
     char line[256];
-    FILE *fp = NULL;
-    int n = 0;
+    unsigned int i;
 
     PR_INFO("==== BLE ENV DUMP begin (%s) ====", tag ? tag : "-");
-
     PR_INFO("dbus socket: %s",
             (access("/run/dbus/system_bus_socket", F_OK) == 0) ? "EXISTS" : "MISSING");
     PR_INFO("machine-id: %s",
             (access("/var/lib/dbus/machine-id", R_OK) == 0) ? "EXISTS" : "MISSING");
-
-    fp = fopen("/var/lib/dbus/machine-id", "r");
-    if (fp != NULL) {
-        if (fgets(line, sizeof(line), fp) != NULL) {
-            line[strcspn(line, "\r\n")] = '\0';
-            PR_INFO("machine-id value: %s", line);
-        }
-        fclose(fp);
-    }
-
-    fp = popen("pidof dbus-daemon 2>/dev/null", "r");
-    if (fp != NULL) {
-        if (fgets(line, sizeof(line), fp) != NULL) {
-            line[strcspn(line, "\r\n")] = '\0';
-            PR_INFO("dbus-daemon pid: %s", line);
-        } else {
-            PR_ERR("dbus-daemon: NOT RUNNING");
-        }
-        pclose(fp);
-    }
-
-    fp = popen("pidof bluetoothd 2>/dev/null", "r");
-    if (fp != NULL) {
-        if (fgets(line, sizeof(line), fp) != NULL) {
-            line[strcspn(line, "\r\n")] = '\0';
-            PR_INFO("bluetoothd pid: %s", line);
-        } else {
-            PR_ERR("bluetoothd: NOT RUNNING");
-        }
-        pclose(fp);
-    }
-
     PR_INFO("hci0 sysfs: %s",
             (access("/sys/class/bluetooth/hci0", F_OK) == 0) ? "EXISTS" : "MISSING");
 
-    fp = popen("hciconfig hci0 2>/dev/null | head -6", "r");
-    if (fp != NULL) {
-        while (fgets(line, sizeof(line), fp) != NULL && n < 6) {
-            line[strcspn(line, "\r\n")] = '\0';
-            if (line[0] != '\0') {
-                PR_INFO("hciconfig: %s", line);
-            }
-            n++;
+    for (i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        FILE *fp = popen(probes[i], "r");
+        int n = 0;
+
+        if (fp == NULL) {
+            continue;
         }
-        pclose(fp);
-    }
-
-    PR_INFO("adv_manager_ready: %d", tuya_adv_manager_ready() ? 1 : 0);
-
-    /* Probe BlueZ Adapter1 / LEAdvertisingManager1 on the bus (async-safe enough for diag). */
-    fp = popen("dbus-send --system --print-reply --dest=org.bluez "
-               "/org/bluez/hci0 org.freedesktop.DBus.Introspectable.Introspect 2>/dev/null "
-               "| tr '<>' '\\n' | grep -E 'LEAdvertising|Adapter1|GattManager' | head -12",
-               "r");
-    if (fp != NULL) {
-        n = 0;
-        while (fgets(line, sizeof(line), fp) != NULL && n < 12) {
+        while ((fgets(line, sizeof(line), fp) != NULL) && (n < 12)) {
             line[strcspn(line, "\r\n")] = '\0';
             if (line[0] != '\0') {
-                PR_INFO("bluez iface: %s", line);
+                PR_INFO("  %s", line);
             }
             n++;
         }
         if (n == 0) {
-            PR_WARN("bluez iface: (none /org/bluez/hci0 introspect empty)");
+            PR_WARN("  (no output) %.40s", probes[i]);
         }
         pclose(fp);
     }
-
-    fp = popen("ps -o args= -C bluetoothd 2>/dev/null || "
-               "tr '\\0' ' ' </proc/$(pidof bluetoothd)/cmdline 2>/dev/null",
-               "r");
-    if (fp != NULL) {
-        if (fgets(line, sizeof(line), fp) != NULL) {
-            line[strcspn(line, "\r\n")] = '\0';
-            PR_INFO("bluetoothd cmdline: %s", line);
-        }
-        pclose(fp);
-    }
-
     PR_INFO("==== BLE ENV DUMP end (%s) ====", tag ? tag : "-");
 }
+#else
+#define __ble_env_dump(tag) do { (void)(tag); } while (0)
+#endif
 
 static void *__loop_run(void *arg)
 {
@@ -128,7 +99,6 @@ int tuya_bluez_init(void)
 
     if (g_bluez_inited) {
         PR_INFO("tuya bluez already initialized");
-        __ble_env_dump("re-init");
         return 0;
     }
 
@@ -140,22 +110,21 @@ int tuya_bluez_init(void)
     ret = tuya_gatt_init();
     if (ret != 0) {
         PR_ERR("tuya_gatt_init error %d", ret);
+        g_main_loop_unref(main_loop);
+        main_loop = NULL;
         return ret;
     }
-    PR_INFO("tuya_gatt_init OK");
 
-    /* Advertising uses raw legacy HCI (tuya_hci), NOT the BlueZ D-Bus adv path.
-     * Do NOT call tuya_adv_init / register a LEAdvertisement1 object -- that
-     * path registers but the chip never airs it, and registering it would make
-     * bluetoothd/mgmt claim advertising (which then rejects raw HCI 0x0C).
-     * Keeping mgmt adv-free lets raw HCI LE Set Adv reach the controller. */
-    /* ret = tuya_adv_init(tuya_gatt_get_connection()); */
-    (void)ret;
-
-    pthread_create(&tid, NULL, __loop_run, main_loop);
-    PR_INFO("g_main_loop thread started");
+    if (pthread_create(&tid, NULL, __loop_run, main_loop) != 0) {
+        PR_ERR("g_main_loop thread create failed");
+        g_main_loop_unref(main_loop);
+        main_loop = NULL;
+        return LE_COM_ERROR;
+    }
+    pthread_detach(tid);
 
     g_bluez_inited = TRUE;
+    PR_INFO("tuya_bluez_init OK (GATT via BlueZ, ADV via raw HCI)");
     __ble_env_dump("post-init");
 
     return 0;
@@ -166,59 +135,42 @@ int tuya_bluez_deinit(void)
     return 0;
 }
 
-/*
- * TAL may issue adv_start / adv_data before (or without) GATT service
- * registration having triggered tuya_bluez_init(). In that case s_adv.conn is
- * NULL, the BlueZ D-Bus path is skipped, and we fall back to legacy HCI
- * LE Set Adv -- which the controller rejects with 0x0C (Command Disallowed)
- * while bluetoothd owns the adapter via MGMT. Force the BlueZ/D-Bus stack up
- * here so advertising always goes through LEAdvertisingManager1.
- */
-static void __ensure_bluez_init(void)
-{
-    if (!g_bluez_inited) {
-        PR_INFO("bluez not inited before adv op; lazy init now");
-        (void)tuya_bluez_init();
-    }
-}
-
-/*
- * Advertising via raw legacy HCI -- the ORIGINAL/working path (this is what
- * transmitted when the device was scannable). The BlueZ D-Bus
- * LEAdvertisingManager1 path (tuya_adv.c) registers the adv but the chip never
- * airs it, so do NOT use it. Raw HCI LE Set Adv goes straight to the controller.
- * Because we don't register a BlueZ advertisement, bluetoothd/mgmt has no adv
- * instance, so there is no MGMT conflict -> raw HCI adv is NOT rejected 0x0C.
- * GATT still uses BlueZ D-Bus (tuya_gatt_*).
- */
 int tuya_bluez_le_set_adv_params(le_set_adv_params_t *params)
 {
+    int ret = 0;
+
     if (params == NULL) {
-        return 1;
+        return LE_INVALID_PARAM;
     }
-    /* Disable first, then try Set Adv Params. If mgmt locks it (0x12), ignore
-     * the failure and use bluetoothd's default params. Return 0 so the caller
-     * continues to Set Data + Enable. DO NOT skip the HCI call entirely — the
-     * retry delay preserves timing that avoids the gdbus race crash. */
+
+    /*
+     * Stop advertising before reprogramming parameters: the controller rejects
+     * LE Set Adv Params while advertising is enabled. If mgmt still holds the
+     * adv slot the command comes back non-zero — that is not fatal, we fall
+     * back to bluetoothd's defaults and let the caller carry on to Set Data +
+     * Enable, so return success either way.
+     *
+     * The 50ms gap between Disable and Set Params is deliberate and was added
+     * to settle a gdbus race crash; it is cheap, so keep it.
+     */
     tuya_hci_le_set_adv_enable(false);
-    usleep(50000);
-    int ret = tuya_hci_le_set_adv_params(params->min_interval, params->max_interval, params->advtype);
-    if (ret != 0) {
-        PR_WARN("adv: Set Adv Params failed (%d), using default params", ret);
+    usleep(50 * 1000);
+    ret = tuya_hci_le_set_adv_params(params->min_interval, params->max_interval, params->advtype);
+    if (ret != LE_SUCCESS) {
+        PR_WARN("adv: Set Adv Params failed (%d), using controller defaults", ret);
     }
-    return 0;
+    return LE_SUCCESS;
 }
 
 int tuya_bluez_le_set_adv_enable(bool enable)
 {
-    PR_INFO("=== adv via RAW HCI (legacy) enable=%d ===", enable);
     return tuya_hci_le_set_adv_enable(enable);
 }
 
 int tuya_bluez_le_set_adv_data(uint8_t *data, uint8_t len)
 {
     if ((data == NULL) || (len == 0)) {
-        return 1;
+        return LE_INVALID_PARAM;
     }
     return tuya_hci_le_set_adv_data(data, len);
 }
@@ -226,7 +178,7 @@ int tuya_bluez_le_set_adv_data(uint8_t *data, uint8_t len)
 int tuya_bluez_le_set_scan_rsp_data(uint8_t *data, uint8_t len)
 {
     if ((data == NULL) || (len == 0)) {
-        return 1;
+        return LE_INVALID_PARAM;
     }
     return tuya_hci_le_set_scan_rsp_data(data, len);
 }
@@ -238,29 +190,27 @@ int tuya_bluez_le_add_gatt_service(le_gatt_service_t *service, uint8_t service_n
     le_gatt_characteristic_t *p_chr = NULL;
     int registered = 0;
 
-    printf("register gatt servicenum: %u\n", service_num);
-    PR_INFO("register gatt servicenum: %u", service_num);
-
     if ((service == NULL) || (service_num == 0)) {
-        return 1;
+        return LE_INVALID_PARAM;
     }
 
     /*
-     * TAL calls gatts_service_add BEFORE tkl_ble_stack_init.
-     * BlueZ/DBus must be ready first, otherwise every register fails and
-     * tal_ble_bt_init maps that to OPRT_OS_ADAPTER_BLE_INIT_FAILED
-     * (0xffff8ffa) — stack never inits and advertising never starts.
+     * TAL calls gatts_service_add BEFORE tkl_ble_stack_init, so BlueZ/D-Bus
+     * must be brought up here. Otherwise every register fails and
+     * tal_ble_bt_init maps that to OPRT_OS_ADAPTER_BLE_INIT_FAILED — the stack
+     * never inits and advertising never starts.
      */
     if (tuya_bluez_init() != 0) {
-        printf("tuya_bluez_init error before gatt register\n");
-        return 1;
+        PR_ERR("tuya_bluez_init failed before gatt register");
+        return LE_COM_ERROR;
     }
+
+    PR_INFO("register gatt service num: %u", service_num);
 
     for (i = 0; i < service_num; i++) {
         svc_uuid = service[i].uuid;
-        printf("svc_uuid:%04x\n", svc_uuid);
         if (tuya_gatt_register_service(svc_uuid) != 0) {
-            printf("tuya_gatt_register_service error\n");
+            PR_ERR("register service 0x%04x failed", svc_uuid);
             continue;
         }
         p_chr = service[i].chr;
@@ -268,29 +218,26 @@ int tuya_bluez_le_add_gatt_service(le_gatt_service_t *service, uint8_t service_n
             uint16_t desc_uuid = 0;
             uint8_t desc_props = 0;
 
-            printf("p_chr[%d].uuid:%s\n", j, p_chr[j].uuid);
-            printf("p_chr[%d].property:%u\n", j, p_chr[j].property);
-            if ((p_chr[j].property & LE_GATT_CHR_PROP_NOTIFY) ||
-                (p_chr[j].property & LE_GATT_CHR_PROP_INDICATE)) {
-                /* CCCD required by many phone stacks before StartNotify/write flow */
+            if (p_chr[j].property & (LE_GATT_CHR_PROP_NOTIFY | LE_GATT_CHR_PROP_INDICATE)) {
+                /* CCCD: many phone stacks require it before StartNotify works. */
                 desc_uuid = 0x2902;
                 desc_props = LE_GATT_CHR_PROP_READ | LE_GATT_CHR_PROP_WRITE;
             }
             if (tuya_gatt_register_characteristic(svc_uuid, p_chr[j].uuid, p_chr[j].property,
                                                   desc_uuid, desc_props) != 0) {
-                printf("tuya_gatt_register_characteristic error\n");
+                PR_ERR("register chr %s failed", (const char *)p_chr[j].uuid);
                 break;
             }
         }
         registered++;
     }
 
-    /* Register with BlueZ only after local objects exist (avoids "No object received"). */
+    /* Register with BlueZ only after local objects exist (else "No object received"). */
     if (registered > 0) {
         tuya_gatt_register_application();
+        return LE_SUCCESS;
     }
-
-    return (registered > 0) ? 0 : 1;
+    return LE_COM_ERROR;
 }
 
 int tuya_bluez_le_gatts_value_notify(uint16_t uuid, uint8_t *value, uint16_t len)
@@ -298,14 +245,11 @@ int tuya_bluez_le_gatts_value_notify(uint16_t uuid, uint8_t *value, uint16_t len
     return tuya_gatt_server_send_characteristic_notification(uuid, value, len);
 }
 
-void tuya_bluez_le_register_connect_event(void(*cb)(int status))
+void tuya_bluez_le_register_connect_event(void (*cb)(int status))
 {
     tuya_gatt_register_connect_event(cb);
 }
 
-/**
- * @brief Register write request event callback
- */
 void tuya_bluez_le_register_write_req_event(void (*cb)(uint16_t uuid, uint8_t *data, uint16_t len))
 {
     tuya_gatt_register_write_req_event(cb);

@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "tuya_cloud_types.h"
 #include "tuya_svc_netmgr.h"
@@ -54,6 +55,7 @@
 #include "tuya_iot_com_api.h"
 #include "tuya_ws_db.h"
 #include "tal_system.h"
+#include "tal_sw_timer.h"
 #include "tal_sleep.h"
 #include "tal_log.h"
 #include "base_event.h"
@@ -250,6 +252,29 @@ STATIC VOID_T __soc_dev_raw_dp_cmd_cb(IN CONST TY_RECV_RAW_DP_S *dp)
     TAL_PR_DEBUG("SOC Rev DP Raw Cmd t1:%d t2:%d dpid:%d len:%u", dp->cmd_tp, dp->dtt_tp, dp->dpid, dp->len);
 }
 
+/* Delay before rebooting on unbind/factory-reset, in ms. The SDK has already flushed all
+ * binding data to flash by the time gw_reset_cb runs, but other EVENT_RESET subscribers
+ * (e.g. __on_ai_toy_reset) and the mqtt_thread teardown still need a moment to finish. */
+#define APP_RESET_REBOOT_DELAY_MS 2000
+
+STATIC TIMER_ID s_reset_reboot_timer = NULL;
+
+/**
+ * @brief One-shot timer callback: flush filesystem caches then reboot after an unbind or
+ * factory reset. Rebooting is what makes the device re-enter netconfig: the SDK's reset
+ * path only tears things down (clears gw_wsm/schema/timer/meta, stops BLE adv, drops MQTT)
+ * and never restarts a netconfig channel by itself.
+ */
+STATIC VOID_T __on_reset_reboot_timer(TIMER_ID timer_id, VOID_T *arg)
+{
+    TAL_PR_NOTICE("factory reset done, rebooting to re-enter netconfig...");
+    /* rootfs is squashfs but /userdata is UBIFS with write-back caching - flush before
+     * resetting, otherwise the just-cleared kv data can be lost and UBIFS needs recovery
+     * on the next boot. */
+    sync();
+    tal_system_reset();
+}
+
 /**
  * @brief Callback to inform the app that a device reset has been requested (e.g. from cloud).
  * @param[in] type Type of reset (e.g. factory reset, reboot).
@@ -257,6 +282,33 @@ STATIC VOID_T __soc_dev_raw_dp_cmd_cb(IN CONST TY_RECV_RAW_DP_S *dp)
 STATIC VOID_T __soc_dev_reset_inform_cb(GW_RESET_TYPE_E type)
 {
     TAL_PR_DEBUG("reset type %d", type);
+
+    /* Reboot only for the types that actually leave the device unbound. Deliberately NOT
+     * handled here:
+     *   GW_RESET_DATA_FACTORY / GW_REMOTE_RESET_DATA_FACTORY - raised while activating
+     *     (cloud_reset=1, local_reset=0); rebooting there would loop the activation.
+     *   GW_UNREGISTER_CLOUD_SERVICE - only asks cloud services to unregister, not an unbind. */
+    switch (type) {
+    case GW_LOCAL_RESET_FACTORY:
+    case GW_REMOTE_UNACTIVE:
+    case GW_LOCAL_UNACTIVE:
+    case GW_REMOTE_RESET_FACTORY:
+        break;
+    default:
+        return;
+    }
+
+    if (s_reset_reboot_timer == NULL) {
+        if (OPRT_OK != tal_sw_timer_create(__on_reset_reboot_timer, NULL, &s_reset_reboot_timer)) {
+            /* Fall back to an immediate reboot - staying up would leave the device unbound
+             * with no netconfig channel, which is worse than a slightly early reset. */
+            TAL_PR_ERR("create reset reboot timer failed, reboot now");
+            sync();
+            tal_system_reset();
+            return;
+        }
+    }
+    tal_sw_timer_start(s_reset_reboot_timer, APP_RESET_REBOOT_DELAY_MS, TAL_TIMER_ONCE);
 }
 
 /**
@@ -290,14 +342,16 @@ STATIC OPERATE_RET __soc_dev_net_status_cb(VOID *data)
 }
 
 /**
- * @brief Event handler for EVENT_RESET. Informs the app of the reset type then triggers system reset.
+ * @brief Event handler for EVENT_RESET. Not subscribed by default - the reboot on unbind is
+ * driven by iot_cbs.gw_reset_cb (__soc_dev_reset_inform_cb) instead, which the SDK calls
+ * after it has flushed all reset data to flash. Kept for setups that prefer the event path;
+ * it delegates so both paths share the same delayed, sync()'d reboot.
  * @param[in] data Cast to GW_RESET_TYPE_E (passed as void* by event system).
- * @return OPRT_OK (tal_system_reset() may not return).
+ * @return OPRT_OK.
  */
 STATIC OPERATE_RET __soc_dev_reset_cb(VOID *data)
 {
     __soc_dev_reset_inform_cb((GW_RESET_TYPE_E)data);
-    tal_system_reset();
     return OPRT_OK;
 }
 
