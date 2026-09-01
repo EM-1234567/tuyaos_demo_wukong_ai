@@ -1,0 +1,48 @@
+From 345a46224ea563b252b49ac5380a495fe9bf2e09 Mon Sep 17 00:00:00 2001
+From: tengzhen <tengzhen.xiong@tuya.com>
+Date: Mon, 31 Aug 2026 19:18:49 +0800
+Subject: [PATCH] alientek rk3506: fix soft_rtc fallback landing outside cert
+ validity
+
+S97soft_rtc's fallback was 2025-01-01, but the Tuya iot-dns leaf certs
+have NotBefore 2026-05-15. So on a board with no saved timestamp the
+script "restored" a clock that still failed the first TLS handshake, and
+tkl_wifi.c's post-GOT_IP path had to correct it afterwards. Use the same
+2026-07-22 provisional time the other two places already use.
+
+Raise MIN_TS to the cert NotBefore as well. It gates both the
+"is the saved timestamp sane" check and the periodic save, so at
+2020-01-01 the save loop would happily persist a known-bad clock and hand
+it back on the next boot.
+
+Also refresh the deployed app binary and its version stamp to 1.0.88 via
+deploy-wukong-app.sh.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../atk-dlrk3506/fs-overlay/etc/init.d/S97soft_rtc       | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S97soft_rtc b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S97soft_rtc
+index c2645162..b7a16743 100755
+--- a/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S97soft_rtc
++++ b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S97soft_rtc
+@@ -17,8 +17,13 @@
+ PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+ RTC_DIR="/userdata/tuya_wukong"
+ RTC_FILE="$RTC_DIR/rtc.timestamp"     # stores last-known epoch seconds
+-FALLBACK_TS=1735689600                 # 2025-01-01 00:00:00 UTC (within cert validity)
+-MIN_TS=1577836800                      # 2020-01-01: anything older is "wrong"
++# 2026-07-22 12:00 UTC. Must be >= the iot-dns leaf cert NotBefore (2026-05-15)
++# or the first TLS handshake to the Tuya cloud fails. The previous value here
++# was 2025-01-01, which is BEFORE that window, so this script "restored" a clock
++# that tkl_wifi.c's post-GOT_IP path then had to correct anyway. Keep this in
++# sync with the same constant in tkl_wifi.c and S98wukong_ai.
++FALLBACK_TS=1784721600
++MIN_TS=1778803200                      # 2026-05-15: cert NotBefore; older is "wrong"
+ SAVE_INTERVAL=600                      # persist current clock every 10 min
+ 
+ mkdir -p "$RTC_DIR"
+-- 
+2.25.1
+

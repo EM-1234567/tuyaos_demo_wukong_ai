@@ -1,0 +1,862 @@
+From 4c2dc851a5d60773cf77a3ad18c3755ae5b19ca6 Mon Sep 17 00:00:00 2001
+From: tengzhen <tengzhen.xiong@tuya.com>
+Date: Mon, 31 Aug 2026 18:48:31 +0800
+Subject: [PATCH] alientek rk3506: BLE/SoftAP provisioning boot chain
+
+Cut roughly 20-30s off "power on" to "phone can see the device". The old
+S39btattach/S41 pair did ~20s of unconditional fixed sleeps on the
+success path, and S39's "hciconfig hci0 up" fought bluetoothd, which owns
+power-up via mgmt. That made S41's plain bring-up fail every boot and
+fall back to its expensive USB unbind/rebind + firmware re-download
+recovery round.
+
+- S39btattach: no btattach at all (this board's BT is USB rtk_btusb, not
+  UART ttyS5), no hciconfig up, and it no longer blocks rcS - it just
+  spawns S41's bring-up in the background so hardware settling overlaps
+  the rest of init.
+- S41ble_ready: plain mgmt path as round 1, USB rebind demoted to a
+  round-2 fallback. Fixed sleeps replaced with 50/100/200ms polling via
+  usleep - busybox sleep has no float support, so "sleep 0.05" errors out
+  and degenerates into a busy wait.
+- S98wukong_ai: blocks on "S41ble_ready wait" for whatever is left of the
+  background bring-up (normally returns immediately) instead of starting
+  bluetoothd itself.
+- S40bluetoothd: defers to S41, which starts bluetoothd only once hci0 is
+  healthy; starting earlier means Index Added never arrives.
+- S03modules_init: the BLE chain is built into the kernel now, so nothing
+  here gates hci0. Remaining modules (wifi, fs, uvc, storage) load in the
+  background instead of serializing rcS.
+- S01overlayfs: seed /var/lib/dbus and /var/lib/misc after the bind mount
+  replaces the squashfs /var/lib, plus the BlueZ STORAGEDIR under
+  /userdata. Without this, dbus cannot create machine-id and BlueZ never
+  comes up.
+- S97soft_rtc: restore wall-clock from /userdata. The board has no
+  battery RTC and Tuya cloud TLS fails against a 1970 clock.
+- etc/main.conf: LE-only ControllerMode, privacy off so the public BDADDR
+  is used in advertising. Rockchip's BlueZ patch sets configdir=/etc, so
+  this is the file bluetoothd actually reads.
+
+Add deploy-wukong-app.sh. The app has no buildroot package - it reaches
+the rootfs by sitting in fs-overlay - and copying the binary there was
+separate from writing the /etc/wukong_ai_build version stamp, so the two
+drifted: the stamp claimed 1.0.86 while the shipped binary was 1.0.87.
+BLE_NETCFG_NOTES.md tells people to trust that stamp when confirming what
+is on the board, so a stale one actively misleads. The script does both
+from one source path, or neither.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../atk-dlrk3506/deploy-wukong-app.sh         |  77 ++++
+ .../fs-overlay/etc/default/bluetoothd         |   5 +
+ .../fs-overlay/etc/init.d/S01overlayfs        |   7 +
+ .../fs-overlay/etc/init.d/S03modules_init.sh  |  19 +-
+ .../fs-overlay/etc/init.d/S39btattach         |  58 +++
+ .../fs-overlay/etc/init.d/S40bluetoothd       |  31 ++
+ .../fs-overlay/etc/init.d/S41ble_ready        | 344 ++++++++++++++++++
+ .../fs-overlay/etc/init.d/S97soft_rtc         |  64 ++++
+ .../fs-overlay/etc/init.d/S98wukong_ai        |  94 +++++
+ .../atk-dlrk3506/fs-overlay/etc/main.conf     |  18 +
+ 10 files changed, 715 insertions(+), 2 deletions(-)
+ create mode 100755 board/alientek/atk-dlrk3506/deploy-wukong-app.sh
+ create mode 100644 board/alientek/atk-dlrk3506/fs-overlay/etc/default/bluetoothd
+ create mode 100755 board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S39btattach
+ create mode 100755 board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S40bluetoothd
+ create mode 100755 board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S41ble_ready
+ create mode 100755 board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S97soft_rtc
+ create mode 100755 board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S98wukong_ai
+ create mode 100644 board/alientek/atk-dlrk3506/fs-overlay/etc/main.conf
+
+diff --git a/board/alientek/atk-dlrk3506/deploy-wukong-app.sh b/board/alientek/atk-dlrk3506/deploy-wukong-app.sh
+new file mode 100755
+index 00000000..27c78d45
+--- /dev/null
++++ b/board/alientek/atk-dlrk3506/deploy-wukong-app.sh
+@@ -0,0 +1,77 @@
++#!/bin/sh
++# =============================================================================
++# deploy-wukong-app.sh — stage a built tuyaos_demo_wukong_ai into the rootfs
++# overlay, and stamp /etc/wukong_ai_build to match it.
++#
++# There is no buildroot package for the app; it reaches the rootfs by sitting
++# in board/alientek/atk-dlrk3506/fs-overlay/ (see BR2_ROOTFS_OVERLAY in
++# configs/alientek_rk3506_defconfig). Copying the binary and writing the
++# version stamp used to be two manual steps, so they drifted: the stamp said
++# 1.0.86 while the shipped binary was 1.0.87. Since BLE_NETCFG_NOTES.md tells
++# people to trust /etc/wukong_ai_build when confirming what is on the board,
++# a lying stamp costs real debugging time.
++#
++# Both are written here, from the same source path, or neither is.
++#
++# Usage:
++#   ./deploy-wukong-app.sh                 # newest build under apps/output/
++#   ./deploy-wukong-app.sh 1.0.87          # that version
++#   ./deploy-wukong-app.sh /path/to/binary # explicit binary
++#
++# After this, rebuild the rootfs — copying into the overlay alone changes
++# nothing on the board:
++#   ./build.sh buildroot && ./build.sh firmware && ./build.sh updateimg
++# =============================================================================
++set -e
++
++SELF=$(readlink -f "$0")
++BOARD_DIR=$(dirname "$SELF")
++OVERLAY="$BOARD_DIR/fs-overlay"
++APP_NAME=tuyaos_demo_wukong_ai
++
++# buildroot/board/alientek/atk-dlrk3506 -> SDK root -> app source tree
++SDK_ROOT=$(readlink -f "$BOARD_DIR/../../../..")
++APP_OUT="$SDK_ROOT/app/$APP_NAME/apps/output"
++
++die() { echo "deploy-wukong-app: $*" >&2; exit 1; }
++
++case "$1" in
++"")
++    # Newest by mtime, not by version sort: 1.0.9 vs 1.0.87 sorts wrong as a
++    # string, and the thing you just built is what you almost always want.
++    [ -d "$APP_OUT" ] || die "no build output at $APP_OUT (run build_rk3506b.sh first)"
++    SRC_DIR=$(ls -1dt "$APP_OUT/${APP_NAME}_"*/ 2>/dev/null | head -1)
++    [ -n "$SRC_DIR" ] || die "no ${APP_NAME}_* directory under $APP_OUT"
++    SRC="${SRC_DIR%/}/$APP_NAME"
++    ;;
++*/*)
++    SRC=$1
++    ;;
++*)
++    SRC="$APP_OUT/${APP_NAME}_$1/$APP_NAME"
++    ;;
++esac
++
++[ -f "$SRC" ] || die "binary not found: $SRC"
++[ -d "$OVERLAY/usr/bin" ] || die "overlay missing: $OVERLAY/usr/bin"
++
++# Version comes from the build directory name (apps/output/<app>_<ver>/), which
++# is the only place it exists — the binary itself carries no reliable version
++# string, and the SDK's own log line is a stale hardcoded constant.
++SRC_PARENT=$(basename "$(dirname "$(readlink -f "$SRC")")")
++case "$SRC_PARENT" in
++"${APP_NAME}_"*) VER="${SRC_PARENT#${APP_NAME}_}" ;;
++*)               VER="unknown" ;;
++esac
++
++cp -f "$SRC" "$OVERLAY/usr/bin/$APP_NAME"
++chmod 0755 "$OVERLAY/usr/bin/$APP_NAME"
++printf 'build=%s %s\n' "$VER" "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$OVERLAY/etc/wukong_ai_build"
++
++echo "deployed : $SRC"
++echo "       -> $OVERLAY/usr/bin/$APP_NAME"
++echo "version  : $VER"
++echo "md5      : $(md5sum "$OVERLAY/usr/bin/$APP_NAME" | cut -d' ' -f1)"
++echo "stamp    : $(cat "$OVERLAY/etc/wukong_ai_build")"
++echo
++echo "Now rebuild the rootfs: ./build.sh buildroot && ./build.sh firmware && ./build.sh updateimg"
+diff --git a/board/alientek/atk-dlrk3506/fs-overlay/etc/default/bluetoothd b/board/alientek/atk-dlrk3506/fs-overlay/etc/default/bluetoothd
+new file mode 100644
+index 00000000..af1a4c8f
+--- /dev/null
++++ b/board/alientek/atk-dlrk3506/fs-overlay/etc/default/bluetoothd
+@@ -0,0 +1,5 @@
++# Runtime args for /etc/init.d/S40bluetoothd
++# -n: foreground (start-stop-daemon backgrounds)
++# -E: experimental D-Bus interfaces
++# Note: S41ble_ready starts bluetoothd with -n -E -d and logs to /var/log/bluetoothd.log
++BLUETOOTHD_ARGS="-n -E"
+diff --git a/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S01overlayfs b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S01overlayfs
+index 12334c4d..0f069efa 100755
+--- a/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S01overlayfs
++++ b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S01overlayfs
+@@ -21,8 +21,15 @@ start() {
+             /usr/bin/mount --bind /userdata /opt
+ 
+             # Setup persistent storage for /var/lib
++            # NOTE: bind replaces squashfs /var/lib. Seed required subdirs
++            # before any daemon starts (dbus needs /var/lib/dbus for machine-id).
+             mkdir -p $OVERLAY_BASE/var/lib
++            mkdir -p $OVERLAY_BASE/var/lib/dbus
++            mkdir -p $OVERLAY_BASE/var/lib/misc
+             /usr/bin/mount --bind $OVERLAY_BASE/var/lib /var/lib
++            mkdir -p /var/lib/dbus /var/lib/misc
++            # Rockchip BlueZ: STORAGEDIR=/data/lib/bluetooth (/data -> userdata)
++            mkdir -p /userdata/lib/bluetooth /data/lib/bluetooth
+             #mkdir -p $OVERLAY_BASE/root
+             #/usr/bin/mount --bind $OVERLAY_BASE/root /root
+         else
+diff --git a/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S03modules_init.sh b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S03modules_init.sh
+index 4a3dbc70..c29937ef 100755
+--- a/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S03modules_init.sh
++++ b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S03modules_init.sh
+@@ -2,10 +2,25 @@
+ #
+ # Modules init
+ #
+-
++# The whole BLE bring-up chain is built into the kernel now: USB PHY, dwc2 and
++# rtk_btusb are all =y, and the RTL8733BU patch/config blobs are linked in via
++# CONFIG_EXTRA_FIRMWARE. So hci0 already exists by the time this script runs —
++# nothing here gates it any more.
++#
++# That leaves only modules that gate nothing: Wi-Fi (8733bu is ~1.7MB, needed
++# for SoftAP/STA but not for BLE advertising) plus fs/uvc/storage. All of them
++# load in the background so rcS can get on with dbus, bluetoothd and the app.
++#
+ 
+ start() {
+-	find /lib/modules/$(uname -r)/kernel/ -name "*.ko" | xargs -I {} sh -c 'modprobe $(basename {})'
++	MODDIR="/lib/modules/$(uname -r)/kernel"
++
++	(
++		modprobe 8733bu 2>/dev/null
++		find "$MODDIR" -name "*.ko" | while read -r ko; do
++			modprobe "$(basename "$ko" .ko)" 2>/dev/null
++		done
++	) &
+ }
+ 
+ stop() {
+diff --git a/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S39btattach b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S39btattach
+new file mode 100755
+index 00000000..f6ee5fae
+--- /dev/null
++++ b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S39btattach
+@@ -0,0 +1,58 @@
++#!/bin/sh
++#
++# S39btattach — kick off the BlueZ bring-up (S41ble_ready) in the background.
++#
++# This board's BT is USB (rtk_btusb), not UART ttyS5, so there is no btattach
++# here at all. What is left is two deliberate rules:
++#
++#   1. Do NOT "hciconfig hci0 up" from here. bluetoothd must be the one to
++#      power the adapter (mgmt/AutoEnable); powering it behind bluetoothd's
++#      back is exactly what used to make S41's plain path fail and force its
++#      expensive USB-rebind recovery round on every single boot.
++#   2. Do NOT block rcS. Waiting for hci0 and for bluetoothd is nearly all
++#      hardware settling time, so it runs concurrently with the rest of the
++#      boot (network, weston, sshd, ...). S41's own bringup waits for
++#      /sys/class/bluetooth/hci0, and S98wukong_ai blocks on the
++#      /var/run/ble_ready.done flag right before starting the app.
++#
++# Logs to /var/log/ble_boot.log
++#
++LOG=/var/log/ble_boot.log
++READY_FLAG=/var/run/ble_ready.done
++RUN_FLAG=/var/run/ble_ready.running
++TRIED_FLAG=/var/run/ble_ready.tried
++
++blog() {
++    mkdir -p /var/log
++    echo "[$(date +%H:%M:%S 2>/dev/null || echo boot)][S39] $*" | tee -a "$LOG"
++}
++
++start() {
++    printf 'Starting btattach: '
++    rm -f "$READY_FLAG" "$TRIED_FLAG"
++    blog "spawn S41ble_ready bringup (USB hci0, no UART btattach, no hciconfig up)"
++
++    # RUN_FLAG is set here, synchronously, so that rcS reaching S41 a moment
++    # later sees a bringup in flight and no-ops instead of starting a second one.
++    touch "$RUN_FLAG"
++    # stdout to /dev/null: S41 already tees everything it prints into $LOG,
++    # so redirecting it there as well would double every line.
++    /etc/init.d/S41ble_ready bringup >/dev/null 2>>"$LOG" &
++
++    echo "OK (bring-up backgrounded)"
++    return 0
++}
++
++stop() {
++    printf 'Stopping btattach: '
++    blog "stop"
++    rm -f "$RUN_FLAG"
++    echo 'OK'
++}
++
++case "$1" in
++    start|restart) start ;;
++    stop) stop ;;
++    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
++esac
++exit 0
+diff --git a/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S40bluetoothd b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S40bluetoothd
+new file mode 100755
+index 00000000..66bb4a2c
+--- /dev/null
++++ b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S40bluetoothd
+@@ -0,0 +1,31 @@
++#!/bin/sh
++#
++# S40bluetoothd — deferred.
++# Bluetoothd is started by S41ble_ready AFTER USB hci0 is healthy, to avoid
++# racing hciconfig/rtk_btusb (Index Added never appears if started too early).
++#
++LOG=/var/log/ble_boot.log
++
++case "$1" in
++    start)
++        mkdir -p /var/log /data/lib/bluetooth /userdata/lib/bluetooth
++        echo "[$(date +%H:%M:%S 2>/dev/null || echo boot)][S40] skip start (deferred to S41ble_ready)" >>"$LOG"
++        printf 'Starting bluetoothd: deferred to S41\n'
++        ;;
++    stop)
++        printf 'Stopping bluetoothd: '
++        if [ -x /usr/libexec/bluetooth/bluetoothd ]; then
++            killall bluetoothd 2>/dev/null || true
++            rm -f /var/run/bluetoothd.pid /run/bluetoothd.pid
++        fi
++        echo 'OK'
++        ;;
++    restart|reload)
++        "$0" stop
++        ;;
++    *)
++        echo "Usage: $0 {start|stop|restart}"
++        exit 1
++        ;;
++esac
++exit 0
+diff --git a/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S41ble_ready b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S41ble_ready
+new file mode 100755
+index 00000000..0c902469
+--- /dev/null
++++ b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S41ble_ready
+@@ -0,0 +1,344 @@
++#!/bin/sh
++#
++# S41ble_ready — export /org/bluez/hciX + LEAdvertisingManager1/GattManager1
++# for Tuya BLE provisioning.
++#
++# Critical for RTL8733BU + Rockchip BlueZ:
++#   bluetoothd must start with hci0 DOWN (mgmt owns power-up).
++#   Starting bluetoothd while hciconfig already has UP often yields NO adapter
++#   on D-Bus for many seconds / forever. S39btattach therefore no longer runs
++#   "hciconfig hci0 up", which is what used to make the plain path fail and
++#   forced the expensive USB-rebind round on every single boot.
++#
++# Boot-time shape:
++#   S39btattach  -> "bringup" in the background (does not block rcS)
++#   S41 (rcS)    -> no-op if a bringup is already in flight
++#   S98wukong_ai -> "wait" on the ready flag just before launching the app
++#
++# Every step polls at 50-200ms instead of using fixed sleeps; on a healthy
++# boot the whole bring-up is a couple of seconds.
++#
++LOG=/var/log/ble_boot.log
++BTLOG=/var/log/bluetoothd.log
++FLAG=/var/run/ble_ready.done
++RUN_FLAG=/var/run/ble_ready.running
++TRIED_FLAG=/var/run/ble_ready.tried
++BTD=/usr/libexec/bluetooth/bluetoothd
++
++ADAPTER=""
++
++blog() {
++    mkdir -p /var/log
++    echo "[$(date +%H:%M:%S 2>/dev/null || echo boot)][S41] $*" | tee -a "$LOG"
++}
++
++# Sub-second waits. busybox sleep is built without FEATURE_FLOAT_SLEEP here, so
++# "sleep 0.05" would fail instantly and turn every poll loop below into a busy
++# spin; usleep (microseconds) is the applet that does work. Fall back to whole
++# seconds if it ever goes missing rather than spinning silently.
++if usleep 1000 2>/dev/null; then
++    msleep() { usleep $(( $1 * 1000 )); }
++else
++    blog "WARN: no usleep applet, polling at 1s"
++    msleep() { sleep 1; }
++fi
++
++# ---------------------------------------------------------------- prerequisites
++
++ensure_storage() {
++    mkdir -p /userdata/lib/bluetooth /data/lib/bluetooth /var/lib/bluetooth
++    if [ -f /etc/bluetooth/main.conf ] && [ ! -f /etc/main.conf ]; then
++        cp -f /etc/bluetooth/main.conf /etc/main.conf
++    fi
++}
++
++ensure_dbus() {
++    mkdir -p /run/dbus /var/lib/dbus
++    dbus-uuidgen --ensure 2>/dev/null
++    if pidof dbus-daemon >/dev/null 2>&1; then
++        blog "dbus pid=$(pidof dbus-daemon)"
++        return 0
++    fi
++    # S30dbus normally has it up already; only start one if it is really absent.
++    rm -f /run/messagebus.pid /var/run/messagebus.pid /run/dbus/system_bus_socket
++    dbus-daemon --system 2>>"$LOG"
++    i=0
++    while [ "$i" -lt 40 ]; do
++        pidof dbus-daemon >/dev/null 2>&1 && return 0
++        msleep 50
++        i=$((i + 1))
++    done
++    blog "ERROR: dbus"
++    return 1
++}
++
++# $1 = number of 50ms ticks to wait for /sys/class/bluetooth/hci0
++wait_hci_sysfs() {
++    i=0
++    while [ "$i" -lt "${1:-200}" ] && [ ! -e /sys/class/bluetooth/hci0 ]; do
++        msleep 50
++        i=$((i + 1))
++    done
++    [ -e /sys/class/bluetooth/hci0 ]
++}
++
++# ---------------------------------------------------------------- bluetoothd
++
++stop_bluetoothd() {
++    if ! pidof bluetoothd >/dev/null 2>&1; then
++        rm -f /var/run/bluetoothd.pid /run/bluetoothd.pid
++        return 0
++    fi
++    killall bluetoothd 2>/dev/null
++    i=0
++    while pidof bluetoothd >/dev/null 2>&1 && [ "$i" -lt 60 ]; do
++        msleep 50
++        i=$((i + 1))
++    done
++    rm -f /var/run/bluetoothd.pid /run/bluetoothd.pid
++}
++
++# hci MUST be down before bluetoothd; BlueZ mgmt + AutoEnable will power it.
++release_hci() {
++    rfkill unblock bluetooth 2>/dev/null || true
++    hciconfig hci0 down >>"$LOG" 2>&1 || true
++    i=0
++    while hciconfig hci0 2>/dev/null | grep -q 'UP RUNNING' && [ "$i" -lt 40 ]; do
++        msleep 50
++        i=$((i + 1))
++    done
++}
++
++start_bluetoothd() {
++    : >"$BTLOG"
++    if [ ! -x "$BTD" ]; then
++        blog "ERROR: $BTD missing"
++        return 1
++    fi
++    # Direct background; avoid shell-wrapper PID confusion
++    "$BTD" -n -E >>"$BTLOG" 2>&1 &
++    echo $! > /var/run/bluetoothd.pid
++    i=0
++    while [ "$i" -lt 60 ]; do
++        if pidof bluetoothd >/dev/null 2>&1; then
++            blog "bluetoothd pid=$(pidof bluetoothd)"
++            return 0
++        fi
++        msleep 50
++        i=$((i + 1))
++    done
++    blog "ERROR: bluetoothd died; log:"
++    cat "$BTLOG" 2>/dev/null | tee -a "$LOG"
++    return 1
++}
++
++# ---------------------------------------------------------------- D-Bus checks
++
++adapter_path() {
++    dbus-send --system --print-reply --dest=org.bluez / \
++        org.freedesktop.DBus.ObjectManager.GetManagedObjects 2>/dev/null \
++        | sed -n 's/.*object path "\(\/org\/bluez\/hci[0-9]*\)".*/\1/p' | head -1
++}
++
++# Wait for bluetoothd to publish the adapter (mgmt "Index Added").
++# $1 = number of 200ms ticks. Round1 passes a short budget deliberately: if the
++# plain path is going to fail on this controller we want to fall through to the
++# USB rebind quickly rather than burn 8s first.
++wait_adapter() {
++    i=0
++    while [ "$i" -lt "${1:-40}" ]; do
++        ADAPTER="$(adapter_path)"
++        if [ -n "$ADAPTER" ]; then
++            blog "adapter $ADAPTER after $((i * 200))ms"
++            return 0
++        fi
++        msleep 200
++        i=$((i + 1))
++    done
++    return 1
++}
++
++power_on() {
++    [ -n "$ADAPTER" ] || return 1
++    dbus-send --system --print-reply --dest=org.bluez \
++        "$ADAPTER" org.freedesktop.DBus.Properties.Set \
++        string:org.bluez.Adapter1 string:Powered variant:boolean:true \
++        >>"$LOG" 2>&1 || true
++}
++
++# The Tuya adapter advertises over raw HCI and serves GATT over BlueZ, so the
++# managers appearing on the adapter is our "radio + stack are usable" proxy.
++managers_present() {
++    dbus-send --system --print-reply --dest=org.bluez \
++        "$ADAPTER" org.freedesktop.DBus.Introspectable.Introspect 2>/dev/null \
++        | grep -q 'LEAdvertisingManager1'
++}
++
++# $1 = number of 200ms ticks; see wait_adapter for why round1 gets less.
++wait_managers() {
++    i=0
++    while [ "$i" -lt "${1:-30}" ]; do
++        if managers_present; then
++            blog "LEAdvertisingManager1 PRESENT after $((i * 200))ms"
++            return 0
++        fi
++        # Re-assert Powered every second; the controller may still be settling.
++        [ $((i % 5)) -eq 4 ] && power_on
++        msleep 200
++        i=$((i + 1))
++    done
++    tail -15 "$BTLOG" 2>/dev/null | tee -a "$LOG" || true
++    return 1
++}
++
++# ---------------------------------------------------------------- recovery
++
++rebind_rtk() {
++    blog "rebind rtk_btusb"
++    for d in /sys/bus/usb/drivers/rtk_btusb/*; do
++        [ -e "$d" ] || continue
++        [ -d "$d" ] || continue
++        base=$(basename "$d")
++        case "$base" in bind|unbind|uevent|module|new_id|remove_id) continue ;; esac
++        if [ -e /sys/bus/usb/drivers/rtk_btusb/unbind ]; then
++            echo "$base" > /sys/bus/usb/drivers/rtk_btusb/unbind 2>>"$LOG" || true
++            msleep 200
++        fi
++        if [ -e /sys/bus/usb/drivers/rtk_btusb/bind ]; then
++            echo "$base" > /sys/bus/usb/drivers/rtk_btusb/bind 2>>"$LOG" || true
++        fi
++    done
++    # Fallback: usb reset of the Realtek composite if rebind failed
++    if ! wait_hci_sysfs 60; then
++        for d in /sys/bus/usb/devices/*; do
++            [ -f "$d/idVendor" ] || continue
++            vid=$(cat "$d/idVendor" 2>/dev/null)
++            [ "$vid" = "0bda" ] || continue
++            if [ -e "$d/authorized" ]; then
++                blog "usb reset $d"
++                echo 0 > "$d/authorized" 2>>"$LOG" || true
++                msleep 500
++                echo 1 > "$d/authorized" 2>>"$LOG" || true
++            fi
++        done
++    fi
++    wait_hci_sysfs 120
++}
++
++# $1 = label, $2 = adapter ticks, $3 = manager ticks (200ms each)
++try_once() {
++    blog "==== try $1 ===="
++    stop_bluetoothd
++    release_hci
++    start_bluetoothd || return 1
++    wait_adapter "$2" || return 1
++    power_on
++    wait_managers "$3"
++}
++
++# ---------------------------------------------------------------- entry points
++
++is_ready() {
++    pidof bluetoothd >/dev/null 2>&1 || return 1
++    ADAPTER="$(adapter_path)"
++    [ -n "$ADAPTER" ] || return 1
++    managers_present
++}
++
++bringup() {
++    touch "$RUN_FLAG" "$TRIED_FLAG"
++    rm -f "$FLAG"
++    blog "==== ble_ready bringup ===="
++    ensure_storage
++    ensure_dbus       || { blog 'FAIL (dbus)';  rm -f "$RUN_FLAG"; return 1; }
++    wait_hci_sysfs 200 || { blog 'FAIL (hci)';  rm -f "$RUN_FLAG"; return 1; }
++
++    # Round1 is now the plain mgmt path. S39 no longer powers hci0 behind
++    # bluetoothd's back, so this succeeds on a healthy boot and the USB rebind
++    # (several seconds + a second firmware download) stays on the error path.
++    if try_once "round1 plain" 15 15; then
++        touch "$FLAG"; rm -f "$RUN_FLAG"
++        hciconfig hci0 2>/dev/null | head -6 | tee -a "$LOG" || true
++        blog "==== ble_ready OK (round1 plain) ===="
++        return 0
++    fi
++
++    # Round2: re-probe the USB function, then retry.
++    rebind_rtk
++    if try_once "round2 rebind" 40 30; then
++        touch "$FLAG"; rm -f "$RUN_FLAG"
++        blog "==== ble_ready OK (round2 rebind) ===="
++        return 0
++    fi
++
++    # Round3: up/down bounce then bluetoothd.
++    blog "recover round3: up/down bounce"
++    stop_bluetoothd
++    hciconfig hci0 up >>"$LOG" 2>&1 || true
++    msleep 500
++    if try_once "round3 bounce" 40 30; then
++        touch "$FLAG"; rm -f "$RUN_FLAG"
++        blog "==== ble_ready OK (round3 bounce) ===="
++        return 0
++    fi
++
++    blog "ERROR FAIL; bluetoothd.log:"
++    cat "$BTLOG" 2>/dev/null | tee -a "$LOG"
++    hciconfig -a 2>/dev/null | head -15 | tee -a "$LOG"
++    rm -f "$RUN_FLAG"
++    return 1
++}
++
++# Block until the background bringup finishes. $1 = tenths of a second.
++wait_ready() {
++    max="${1:-200}"
++    i=0
++    while [ "$i" -lt "$max" ]; do
++        [ -f "$FLAG" ] && { blog "wait: ready after $((i * 100))ms"; return 0; }
++        # Nothing in flight and no flag: the bringup never ran or it failed.
++        [ -f "$RUN_FLAG" ] || break
++        msleep 100
++        i=$((i + 1))
++    done
++    if is_ready; then
++        touch "$FLAG"
++        blog "wait: ready (late check) after $((i * 100))ms"
++        return 0
++    fi
++    blog "wait: NOT ready after $((i * 100))ms"
++    return 1
++}
++
++start() {
++    printf 'Starting ble_ready: '
++    # S39btattach already spawned the bringup; do not block rcS behind it, and
++    # do not re-run a bringup that already ran and failed here either — S98
++    # gets exactly one recovery attempt right before the app starts.
++    if [ -f "$RUN_FLAG" ] || [ -f "$TRIED_FLAG" ]; then
++        echo 'OK (bringup handled at boot)'
++        return 0
++    fi
++    if [ -f "$FLAG" ] && is_ready; then
++        echo 'OK (already ready)'
++        return 0
++    fi
++    if bringup; then
++        echo 'OK'
++        return 0
++    fi
++    echo 'FAIL'
++    return 1
++}
++
++# Propagate the verb's result: S98wukong_ai keys its recovery bringup off the
++# exit status of "wait", so a blanket "exit 0" here would hide every failure.
++rc=0
++case "$1" in
++    start|restart) start        || rc=$? ;;
++    bringup)       bringup      || rc=$? ;;
++    wait)          wait_ready "$2" || rc=$? ;;
++    status)        is_ready && echo ready || { echo "not ready"; rc=1; } ;;
++    stop)          rm -f "$FLAG" "$RUN_FLAG" "$TRIED_FLAG"; echo 'Stopping ble_ready: OK' ;;
++    *) echo "Usage: $0 {start|bringup|wait [tenths]|status|stop|restart}"; exit 1 ;;
++esac
++exit $rc
+diff --git a/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S97soft_rtc b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S97soft_rtc
+new file mode 100755
+index 00000000..c2645162
+--- /dev/null
++++ b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S97soft_rtc
+@@ -0,0 +1,64 @@
++#!/bin/sh
++### BEGIN INIT INFO
++# Provides:          soft_rtc
++# Required-Start:    $local_fs
++# Required-Stop:
++# Default-Start:     2 3 4 5
++# Default-Stop:      0 1 6
++# Short-Description: Software RTC (no battery RTC on RK3506B)
++# Description:       ATK-DLRK3506B has no hardware/battery RTC, so on boot the
++#                    system clock is wrong (epoch or kernel-build time) and TLS
++#                    cert validation against the Tuya cloud fails. This restores
++#                    the last-known wall-clock from /userdata so the first TLS
++#                    handshake succeeds; TuyaOS SNTP then corrects it after the
++#                    cloud link is up, and the background loop persists it.
++### END INIT INFO
++
++PATH="/usr/sbin:/usr/bin:/sbin:/bin"
++RTC_DIR="/userdata/tuya_wukong"
++RTC_FILE="$RTC_DIR/rtc.timestamp"     # stores last-known epoch seconds
++FALLBACK_TS=1735689600                 # 2025-01-01 00:00:00 UTC (within cert validity)
++MIN_TS=1577836800                      # 2020-01-01: anything older is "wrong"
++SAVE_INTERVAL=600                      # persist current clock every 10 min
++
++mkdir -p "$RTC_DIR"
++
++now_ts() { date +%s; }
++
++restore_time()
++{
++    cur=$(now_ts)
++    saved=$(cat "$RTC_FILE" 2>/dev/null)
++    # choose saved if it's sane and newer than the current (wrong) clock
++    if [ -n "$saved" ] && [ "$saved" -gt "$MIN_TS" ] && [ "$saved" -gt "$cur" ]; then
++        echo "[soft_rtc] restore from $RTC_FILE -> $saved"
++        date -s "@$saved" >/dev/null 2>&1
++    else
++        echo "[soft_rtc] no valid saved time; using fallback $(date -u -d @$FALLBACK_TS 2>/dev/null)"
++        date -s "@$FALLBACK_TS" >/dev/null 2>&1
++    fi
++    # if a hardware /dev/rtc0 ever shows up (RTC battery fitted), prefer it
++    if [ -e /dev/rtc0 ]; then
++        hwclock -s 2>/dev/null || rtcwake --help >/dev/null 2>&1
++        echo "[soft_rtc] /dev/rtc0 present — hwclock applied"
++    fi
++}
++
++save_loop()
++{
++    while true; do
++        sleep "$SAVE_INTERVAL"
++        now=$(now_ts)
++        [ "$now" -gt "$MIN_TS" ] && echo "$now" > "$RTC_FILE"
++    done
++}
++
++case "$1" in
++    start)
++        restore_time
++        save_loop &
++        ;;
++    stop) ;;
++    *)  echo "Usage: $0 {start}"; exit 1 ;;
++esac
++exit 0
+diff --git a/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S98wukong_ai b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S98wukong_ai
+new file mode 100755
+index 00000000..9ded171d
+--- /dev/null
++++ b/board/alientek/atk-dlrk3506/fs-overlay/etc/init.d/S98wukong_ai
+@@ -0,0 +1,94 @@
++#!/bin/sh
++### BEGIN INIT INFO
++# Provides:          wukong_ai
++# Required-Start:    $remote_fs
++# Required-Stop:     $remote_fs
++# Default-Start:     2 3 4 5
++# Default-Stop:      0 1 6
++# Short-Description: TuyaOS Wukong AI demo (cloud-connected)
++# Description:       Launches tuyaos_demo_wukong_ai on boot. The app itself
++#                    drives Wi-Fi provisioning (AP mode) and the Tuya cloud
++#                    connection, so we just start it and keep it alive.
++### END INIT INFO
++
++PATH="/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin"
++. /etc/profile
++
++DAEMON="/usr/bin/tuyaos_demo_wukong_ai"
++WORKDIR="/userdata/tuya_wukong"      # writable; holds ./tuya_db_files/ and flash backing file
++LOGFILE="/var/log/wukong_ai.log"
++PIDFILE="/var/run/wukong_ai.pid"
++
++mkdir -p "$WORKDIR" "$(dirname "$LOGFILE")"
++
++start_wukong()
++{
++    if [ ! -x "$DAEMON" ]; then
++        echo "[wukong_ai] $DAEMON not installed — skipping."
++        return 0
++    fi
++    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
++        echo "[wukong_ai] already running"
++        return 0
++    fi
++    echo -n "Starting wukong_ai... "
++    # TKL SoftAP/STA must own wlan0; connman fights hostapd/wpa_supplicant.
++    killall -q connmand 2>/dev/null
++    rfkill unblock wifi 2>/dev/null
++    # Wi-Fi-only product: keep eth0 down so Tuya netmgr won't prefer "wired".
++    ifconfig eth0 down 2>/dev/null
++    # soft_rtc often starts at 2025; iot-dns leaf certs need >= 2026-05-15.
++    TS=$(date +%s 2>/dev/null)
++    if [ -z "$TS" ] || [ "$TS" -lt 1778803200 ]; then
++        date -s '@1784721600' >/tmp/tkl_date_boot.log 2>&1
++    fi
++    # S39btattach kicked the bring-up off in the background at the top of boot,
++    # so this normally returns immediately; block only for whatever is left of
++    # it (100ms granularity, 20s cap) instead of restarting bluetoothd here.
++    echo "[S98] wait for ble_ready" >> /var/log/ble_boot.log
++    BLE_OK=1
++    if [ -x /etc/init.d/S41ble_ready ]; then
++        # S41 tees its own output into ble_boot.log; don't double it here.
++        if ! /etc/init.d/S41ble_ready wait 200 >/dev/null 2>&1; then
++            echo "[S98] WARN: not ready, one recovery bringup" >> /var/log/ble_boot.log
++            /etc/init.d/S41ble_ready bringup >/dev/null 2>&1 || true
++            /etc/init.d/S41ble_ready status >/dev/null 2>&1 || BLE_OK=0
++        fi
++    fi
++    if [ "$BLE_OK" -eq 0 ]; then
++        echo "[S98] WARN: BLE not fully ready (continue anyway)" >> /var/log/ble_boot.log
++        pidof dbus-daemon bluetoothd >> /var/log/ble_boot.log 2>&1 || true
++        hciconfig -a 2>>/var/log/ble_boot.log | head -20 || true
++        dbus-send --system --print-reply --dest=org.bluez / \
++            org.freedesktop.DBus.ObjectManager.GetManagedObjects 2>>/var/log/ble_boot.log \
++            | grep -E 'object path|LEAdvertising|Adapter1' | head -40 >> /var/log/ble_boot.log || true
++        echo "[S98] ---- bluetoothd.log ----" >> /var/log/ble_boot.log
++        tail -60 /var/log/bluetoothd.log >> /var/log/ble_boot.log 2>/dev/null || true
++    fi
++    cd "$WORKDIR"
++    # The app opens SoftAP + BLE adv for provisioning, then connects to cloud.
++    "$DAEMON" >>"$LOGFILE" 2>&1 &
++    echo $! > "$PIDFILE"
++    echo "done (pid $(cat "$PIDFILE"), log: $LOGFILE)"
++}
++
++stop_wukong()
++{
++    echo -n "Stopping wukong_ai... "
++    if [ -f "$PIDFILE" ]; then kill "$(cat "$PIDFILE")" 2>/dev/null; rm -f "$PIDFILE"; fi
++    killall tuyaos_demo_wukong_ai 2>/dev/null
++    echo "done."
++}
++
++case "$1" in
++    start)        start_wukong ;;
++    stop)         stop_wukong ;;
++    restart|reload) stop_wukong; sleep 1; start_wukong ;;
++    status)
++        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
++            echo "running (pid $(cat "$PIDFILE"))"; exit 0
++        fi
++        echo "stopped"; exit 3 ;;
++    *)  echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
++esac
++exit 0
+diff --git a/board/alientek/atk-dlrk3506/fs-overlay/etc/main.conf b/board/alientek/atk-dlrk3506/fs-overlay/etc/main.conf
+new file mode 100644
+index 00000000..e65e448f
+--- /dev/null
++++ b/board/alientek/atk-dlrk3506/fs-overlay/etc/main.conf
+@@ -0,0 +1,18 @@
++[General]
++# Rockchip bluetoothd loads /etc/main.conf (patch forces configdir=/etc)
++Name = Tuya-Wukong
++# LE-only: this product provisions over BLE and uses no BR/EDR profile, so
++# skipping BR/EDR setup shortens bluetoothd's adapter init and keeps page/inquiry
++# scan off the air during provisioning (less WiFi/BT coex contention on the
++# RTL8733BU combo). Set back to "dual" if a BR/EDR profile is ever needed.
++ControllerMode = le
++# Privacy off so public BDADDR is used in advertising (APP scans FD50)
++Privacy = off
++# Rockchip extension
++SSP = on
++
++[Policy]
++AutoEnable=true
++
++[GATT]
++Channels = 1
+-- 
+2.25.1
+

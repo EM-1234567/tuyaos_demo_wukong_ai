@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# 构建产物
+# ---------------------------------------------------------------------------
+# 每次构建生成一个 apps/output/<app>_<ver>/ 目录，跑一天就是几十个、几百 MB。
+# 需要交付某个版本的二进制时，走 buildroot 的 deploy-wukong-app.sh 把它放进
+# rootfs overlay（那份是 tracked 的），不要往这里提交。
+/output/
+/apps/output/
+
+# 中间对象
+.objs/
+*.o
+*.d
+
+# ---------------------------------------------------------------------------
+# libs/ —— 必须逐个点名，不能整目录忽略
+# ---------------------------------------------------------------------------
+# 这个目录混着两类东西：
+#   构建输入（TuyaOS SDK 随包给的预编译库，构建离不开它）：
+#       libtuyaos.a / libtuyaos.a.stripped / libopus.so*
+#   构建产物（本仓库自己编出来的，每次构建都变）：
+#       libtuyaos_adapter.a / libtuyaos_demo_wukong_ai.a / libtuyaapp_*.a
+# 所以只忽略产物。整个 libs/ 一刀切会让人误以为输入也是可再生的。
+/libs/libtuyaos_adapter.a
+/libs/libtuyaos_adapter.a.stripped
+/libs/libtuyaos_demo_wukong_ai.a
+/libs/libtuyaos_demo_wukong_ai.a.stripped
+/libs/libtuyaapp_components.a
+/libs/libtuyaapp_components.a.stripped
+/libs/libtuyaapp_drivers.a
+/libs/libtuyaapp_drivers.a.stripped
+
+# ---------------------------------------------------------------------------
+# 交叉工具链（约 1.6GB）
+# ---------------------------------------------------------------------------
+# 由 TuyaOS SDK 包提供，不进版本库。路径写死在
+# vendor/.../tuyaos/Makefile 的 TUYA_TC_BIN 里。
+/vendor/*/toolchain/
+
+# ---------------------------------------------------------------------------
+# 移植期的备份残留
+# ---------------------------------------------------------------------------
+*.orig
+*.rej
+*~
