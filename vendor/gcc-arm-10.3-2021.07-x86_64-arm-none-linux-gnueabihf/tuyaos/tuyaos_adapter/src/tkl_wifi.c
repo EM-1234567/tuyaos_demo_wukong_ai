@@ -44,8 +44,19 @@
 #define TKL_DEF_AP_MAX_CONN  8
 #define TKL_DEF_AP_BEACON    100
 #define TKL_CONNECT_FAIL_SEC 60
-/* Don't hammer wpa with scan+reassociate every second while it is stuck. */
+/* Don't hammer wpa with reassociate every second while it is stuck. */
 #define TKL_REASSOC_MIN_SEC  5
+/*
+ * Leave a genuine association alone for this long before calling wpa "stuck".
+ * wpa_supplicant reports DISCONNECTED as the FIRST state of every association
+ * (DISCONNECTED -> SCANNING -> AUTHENTICATING -> ASSOCIATING -> 4WAY ->
+ * COMPLETED), so without a grace period the recovery below fires on the first
+ * monitor tick and interrupts the connection it is supposed to be rescuing.
+ * The connect path itself spends ~3.4s in fixed sleeps (stop_ap, radio settle,
+ * wpa start) before association even begins, and a slow AP can take ~10s more,
+ * so this has to be well clear of both.
+ */
+#define TKL_REASSOC_GRACE_SEC 15
 /* Throttle for the "wait IP" progress trace. */
 #define TKL_PROGRESS_LOG_SEC 3
 
@@ -844,18 +855,29 @@ static void *tkl_wifi_monitor(void *arg)
             }
 
             /*
-             * Recovery, NOT debug: the SoftAP->STA handoff often parks wpa in
-             * INACTIVE/DISCONNECTED with nothing driving it forward. This used
-             * to live inside the field-debug block, so silencing the logs also
-             * silently removed the only thing that unstuck provisioning.
+             * Recovery for a genuinely stuck association: the SoftAP->STA
+             * handoff can park wpa in INACTIVE/DISCONNECTED with nothing
+             * driving it forward.
+             *
+             * Only after TKL_REASSOC_GRACE_SEC, because DISCONNECTED is also
+             * the normal first state of every association. Firing immediately
+             * broke the connection instead of rescuing it: s_reassoc_last_try
+             * is reset to 0 on each connect, so (now - 0) >= 5 was already true
+             * on the first monitor tick, ~1s after wpa was told to connect.
+             *
+             * No bare "scan" here either. reassociate makes wpa scan on its own
+             * when it needs to, whereas a standalone scan takes the radio
+             * off-channel for seconds and can abort an association that is
+             * already in progress - the exact failure this block causes when it
+             * fires too early.
              */
             if (connecting && cur != WSS_GOT_IP &&
+                (now - s_conn_start_ts) >= TKL_REASSOC_GRACE_SEC &&
                 (!strcmp(ws, "INACTIVE") || !strcmp(ws, "DISCONNECTED"))) {
                 if ((now - s_reassoc_last_try) >= TKL_REASSOC_MIN_SEC) {
                     s_reassoc_last_try = now;
-                    TKL_LOG("wpa stuck in %s -> scan+reassociate ssid=%s (%lds since connect)",
-                            ws, s_conn_ssid, (long)(now - s_conn_start_ts));
-                    tkl_wpa("scan", NULL, 0);
+                    TKL_LOG("wpa stuck in %s for %lds -> reassociate ssid=%s",
+                            ws, (long)(now - s_conn_start_ts), s_conn_ssid);
                     tkl_wpa("reassociate", NULL, 0);
                 }
             }
