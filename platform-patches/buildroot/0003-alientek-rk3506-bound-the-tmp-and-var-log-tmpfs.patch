@@ -1,0 +1,85 @@
+From 7bc4b9c596891c6e0b0e2063cf7e9af0932701cd Mon Sep 17 00:00:00 2001
+From: tengzhen <tengzhen.xiong@tuya.com>
+Date: Tue, 1 Sep 2026 09:26:58 +0800
+Subject: [PATCH] alientek rk3506: bound the /tmp and /var/log tmpfs
+
+Both are tmpfs, i.e. RAM, and a tmpfs with no size= defaults to half of
+physical memory. Nothing on this board rotates or truncates its logs:
+S98wukong_ai appends the app's entire stdout+stderr to
+/var/log/wukong_ai.log with >> and never rolls it, ble_boot.log grows per
+boot, and TKL_LOG writes /tmp/tkl_wifi.log in addition to stdout so every
+Wi-Fi line is stored twice. A device churning through reconnects can hand
+half its RAM to log text, and the failure is not a clean OOM: once tmpfs
+is full, /run pid files and the ble_ready flag files start failing too.
+
+Cap /tmp at 16M and /var/log at 8M. This does not stop the growth, it
+bounds the blast radius - a runaway log fails its own writes with ENOSPC
+instead of starving the rest of the system.
+
+Sized against what actually lands there: /tmp otherwise holds only small
+TKL files (hostapd/dnsmasq conf, pid, leases), and there is no OTA
+staging to accommodate because tkl_ota.c returns OPRT_NOT_SUPPORTED on
+this port.
+
+The file overrides package/skeleton-init-sysv/skeleton/etc/fstab, which
+is shared by every board here, so it is a board overlay rather than a
+patch there. It carries the skeleton's lines only. /, proc, devtmpfs,
+devpts, /dev/shm, sysfs, configfs, debugfs, pstore, /oem and /userdata
+are all deleted and re-appended by post-fstab.sh, which runs as a
+post-rootfs hook after this overlay is applied; listing them here would
+just be duplicates it rewrites. That hook does not touch /tmp, /run or
+/var/log, which is what lets these caps survive - verified against the
+generated target/etc/fstab.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../atk-dlrk3506/fs-overlay/etc/fstab         | 37 +++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+ create mode 100644 board/alientek/atk-dlrk3506/fs-overlay/etc/fstab
+
+diff --git a/board/alientek/atk-dlrk3506/fs-overlay/etc/fstab b/board/alientek/atk-dlrk3506/fs-overlay/etc/fstab
+new file mode 100644
+index 00000000..366f41a2
+--- /dev/null
++++ b/board/alientek/atk-dlrk3506/fs-overlay/etc/fstab
+@@ -0,0 +1,37 @@
++# Board fstab for ATK-DLRK3506B.
++#
++# Overrides package/skeleton-init-sysv/skeleton/etc/fstab (shared by every board
++# in this tree, hence a copy here rather than a patch there). Content is the
++# skeleton verbatim apart from size= on /tmp and /var/log.
++#
++# Deliberately does NOT list /, proc, devtmpfs, devpts, /dev/shm, sysfs,
++# configfs, debugfs, pstore, /oem or /userdata. device/rockchip/common/scripts/
++# post-fstab.sh runs as a post-rootfs hook AFTER this overlay is applied and
++# deletes + re-appends every one of those from the partition layout. Repeating
++# them here would just be stale duplicates the hook rewrites anyway. It does not
++# touch /tmp, /run or /var/log, which is why the caps below survive.
++#
++# Why cap: both are tmpfs, i.e. RAM, and a tmpfs with no size= defaults to half
++# of physical memory. Nothing on this board rotates or truncates its logs:
++#   /var/log/wukong_ai.log  S98wukong_ai appends the app's whole stdout+stderr
++#                           with >>, forever, across restarts
++#   /var/log/ble_boot.log   S39/S41/S98 boot trace
++#   /tmp/tkl_wifi.log       TKL_LOG writes here as well as to stdout, so every
++#                           Wi-Fi line costs RAM twice
++# Uncapped, a device churning through reconnects can hand half its RAM to log
++# text. The cap does not stop the growth, it bounds the blast radius: a runaway
++# log fails its own writes with ENOSPC instead of starving the system. Raise
++# them if you need a longer field trace.
++#
++# /tmp otherwise holds only small TKL files (hostapd/dnsmasq conf, pid, leases).
++# No OTA staging to size around - tkl_ota.c returns OPRT_NOT_SUPPORTED here.
++#
++# <file system>	<mount pt>	<type>	<options>	<dump>	<pass>
++/dev/root	/		ext2	rw,noauto	0	1
++proc		/proc		proc	defaults	0	0
++devpts		/dev/pts	devpts	defaults,gid=5,mode=620,ptmxmode=0666	0	0
++tmpfs		/dev/shm	tmpfs	mode=0777	0	0
++tmpfs		/tmp		tmpfs	mode=1777,size=16M	0	0
++tmpfs		/run		tmpfs	mode=0755,nosuid,nodev	0	0
++tmpfs		/var/log	tmpfs	mode=0755,nosuid,nodev,size=8M	0	0
++sysfs		/sys		sysfs	defaults	0	0
+-- 
+2.25.1
+

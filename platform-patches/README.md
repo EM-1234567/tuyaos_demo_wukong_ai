@@ -15,6 +15,7 @@ RK3506B 的 BLE + SoftAP 配网**不只**靠这个仓库的适配层代码。真
 | `kernel/0001-*.patch` | `kernel-6.1/` | `HCI_QUIRK_BROKEN_EXT_ADV`、legacy 广播不超时、100/120ms 广播间隔、rtk_btusb 与 USB 改内建 |
 | `buildroot/0001-*.patch` | `buildroot/` | S39/S40/S41/S97/S98 启动链、S01overlayfs 预建 dbus 目录、`etc/main.conf`、`deploy-wukong-app.sh` |
 | `buildroot/0002-*.patch` | `buildroot/` | S97soft_rtc 回退时间修正到证书有效期内 |
+| `buildroot/0003-*.patch` | `buildroot/` | `etc/fstab` 给 `/tmp`(16M) 和 `/var/log`(8M) 两个 tmpfs 加 `size=` 上限 |
 
 ## 应用方式
 
@@ -54,7 +55,7 @@ git am  <此仓库>/platform-patches/buildroot/*.patch
 cd <SDK>/kernel-6.1 && git format-patch -1 --no-numbered \
     -o <此仓库>/platform-patches/kernel HEAD
 
-cd <SDK>/buildroot  && git format-patch -2 --no-numbered \
+cd <SDK>/buildroot  && git format-patch -3 --no-numbered \
     -o <此仓库>/platform-patches/buildroot HEAD \
     -- . ':(exclude)board/alientek/atk-dlrk3506/fs-overlay/usr/bin/tuyaos_demo_wukong_ai' \
          ':(exclude)board/alientek/atk-dlrk3506/fs-overlay/etc/wukong_ai_build'
