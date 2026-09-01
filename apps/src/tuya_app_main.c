@@ -112,8 +112,8 @@
   * With UUID+AUTHKEY defined, __soc_device_init() takes the set_gw_prod_info()
   * path instead of the MF production-test path. Burn via MF tool instead by
   * commenting these two lines out. */
- #define UUID           "uuida9fb6337c4540722"
- #define AUTHKEY        "YfnQSkn0HBX4A5qe1MNng037qS5ikBV9"
+ #define UUID           "uuidfaf4d00484f48e39"
+ #define AUTHKEY        "hvEmuW9aZ7RcqKRfu9dx8PeaKnAKEpBX"
 
 
 /* ---------------------------------------------------------------------------
