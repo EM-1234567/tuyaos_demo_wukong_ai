@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <stdio.h>
+#include <sys/reboot.h>
 // --- END: user defines and implements ---
 
 /**
@@ -30,7 +31,40 @@
 VOID_T tkl_system_reset(VOID_T)
 {
     // --- BEGIN: user implements ---
-    return;
+    /*
+     * This was an empty stub, so every caller of tal_system_reset() silently
+     * did nothing. That is how a cloud unbind left the device stuck: the SDK
+     * reset path tears everything down (clears gw_wsm/schema/timer/meta, stops
+     * BLE adv, drops MQTT) and never restarts a netconfig channel, so the
+     * reboot is the only thing that brings SoftAP/BLE back. Without it the
+     * device sat unbound and invisible until someone power-cycled it.
+     *
+     * Go through init rather than the reboot() syscall: busybox init runs
+     * /etc/init.d/rcK and unmounts /userdata, which is UBIFS. A syscall reboot
+     * skips that, and while UBIFS survives it via its journal, the next mount
+     * pays for recovery.
+     */
+    printf("[tkl_system] reset: rebooting now\n");
+    sync();
+
+    if (system("reboot") != 0) {
+        /* init unreachable or /sbin/reboot missing - ask the kernel directly
+         * rather than returning as if a reboot had happened. */
+        printf("[tkl_system] reset: 'reboot' failed, falling back to syscall\n");
+        sync();
+        reboot(RB_AUTOBOOT);
+        printf("[tkl_system] reset: reboot syscall returned - not permitted?\n");
+        return;
+    }
+
+    /*
+     * busybox reboot only signals init and returns; the shutdown then takes a
+     * moment. Block here so the caller cannot carry on doing work - notably
+     * touching the kv store - in a process that is about to be killed.
+     */
+    for (;;) {
+        sleep(1);
+    }
     // --- END: user implements ---
 }
 
