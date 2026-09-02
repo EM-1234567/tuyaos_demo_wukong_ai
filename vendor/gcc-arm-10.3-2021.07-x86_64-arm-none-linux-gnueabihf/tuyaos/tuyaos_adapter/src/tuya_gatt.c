@@ -366,7 +366,33 @@ static void chr_write(struct characteristic *chr, const uint8_t *value, int len)
     chr->value = g_memdup(value, len);
     chr->vlen = len;
 
-    g_dbus_emit_property_changed(connection, chr->path, GATT_CHR_IFACE, "Value");
+    /*
+     * FLUSH, not the plain g_dbus_emit_property_changed(). This is a
+     * notification path, and the plain variant COALESCES.
+     *
+     * gdbus/gdbus.h says it outright: "when multiple properties for a given
+     * object path are changed in the same mainloop iteration, they will be
+     * grouped with the last property changed". Concretely, gdbus/object.c:1811
+     * early-returns when the property is already queued, and the queued signal
+     * is only assembled later from a g_idle_add() callback, which re-reads the
+     * value through the property getter at flush time.
+     *
+     * There is one value slot per characteristic (the g_free/g_memdup above),
+     * so two notifications emitted inside a single main-loop iteration end as
+     * ONE signal carrying the SECOND payload -- the first is freed before it is
+     * ever serialised, and the caller still sees success.
+     *
+     * modules/tuya-ble does exactly that, in exactly one place: handle_pair_req()
+     * sends the pair response (cmd 0x0001) and then the net-status frame
+     * (cmd 0x001E) back to back with no yield, both from inside the WriteValue
+     * dispatch. Without FLUSH the phone only ever receives the net-status frame,
+     * waits forever for the pair response, and reports a provisioning failure --
+     * after a log that shows both frames sent. Every other exchange in the
+     * protocol is a single send, which is why only this step failed.
+     */
+    g_dbus_emit_property_changed_full(connection, chr->path, GATT_CHR_IFACE,
+                                      "Value",
+                                      G_DBUS_PROPERTY_CHANGED_FLAG_FLUSH);
 }
 
 static void chr_set_value(const GDBusPropertyTable *property, DBusMessageIter *iter, GDBusPendingPropertySet id, void *user_data)

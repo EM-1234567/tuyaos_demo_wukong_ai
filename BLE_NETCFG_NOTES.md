@@ -215,6 +215,33 @@ Notify 特征需带 CCCD `0x2902`，否则部分手机走不通 `StartNotify`。
 - **原因**：抓包期间未真正发起 App 配网，或抓完才连。  
 - **处理**：先开 `btmon`，再在 App 里点添加/连接，结束后再停。
 
+### 16. 同一轮主循环里连发两个 Notify，第一个会被静默吞掉 ⚠️
+
+- **现象**：配对握手全部成功（`Paired successfully`），设备日志显示两帧都发了
+  （`[TX] cmd=0x0001` 配对响应 + `[TX] cmd=0x001E` 网络状态），但 App 收不到第一帧，
+  一直等下去，最后报配网失败。**日志里没有任何错误**，两次发送都返回成功。
+- **原因**：`tuya_gatt.c` 的 `chr_write()` 原本用的是 `g_dbus_emit_property_changed()`，
+  这个**非 flush 变体会合并同一轮主循环内的属性变更**。BlueZ 自己的
+  `gdbus/gdbus.h` 就写着：*"when multiple properties for a given object path are
+  changed in the same mainloop iteration, they will be grouped with the last
+  property changed"*。具体在 `gdbus/object.c:1811`：属性已在 pending 队列时直接
+  `return`；真正的信号要等 `g_idle_add()` 回调才组装，那时**重新读取**
+  `chr->value`。
+  而每个特征只有一个值槽（`chr_write()` 里 `g_free` + `g_memdup`），所以连发两次的
+  结果是：第一帧的字节被 `g_free` 掉，最终只发出**一条** PropertiesChanged，内容是
+  **第二帧**。
+- **触发点**：`modules/tuya-ble` 的 `handle_pair_req()` 是整个协议里**唯一**连发两帧
+  的地方（配对响应 + 网络状态，中间不 yield，都在 WriteValue 的 dispatch 内）。
+  其他交互都是单发，所以只有这一步会挂。
+- **处理**：`chr_write()` 改用
+  `g_dbus_emit_property_changed_full(..., G_DBUS_PROPERTY_CHANGED_FLAG_FLUSH)`。
+  **注意**：不能在调用方事后补一次 flush——属性一旦入队，`object.c:1811` 会在到达
+  flush 分支之前就 return。
+- **排查提示**：日志显示「发了」不等于「上了空口」。这一条和问题 1 是同一类陷阱，只是
+  发生在 GATT 层而不是广播层。
+
+*（2026-09-01 在 agentic_kit 侧定位。本仓库的 `tuya_gatt.c` 与之逐字节相同，已同步修复。）*
+
 ### 15. 开机到「手机能扫到」太慢（约 20~30s 纯 sleep）
 
 - **现象**：上电后要等很久 App 才扫得到设备，串口上 `S39`/`S41` 阶段肉眼可见地卡住。  
@@ -296,6 +323,44 @@ iwconfig 2>/dev/null | head
 | BlueZ legacy 补丁 | 已删除，理由见问题 6 |
 | 内核 ADV 相关 | `kernel-6.1/net/bluetooth/hci_sync.c`、`hci_event.c`、`include/net/bluetooth/hci.h`（`HCI_QUIRK_BROKEN_EXT_ADV`）、`drivers/bluetooth/bluetooth_usb_driver/rtk_bt.c`（置位处） |
 | App 部署 / 版本戳 | `buildroot/board/alientek/atk-dlrk3506/deploy-wukong-app.sh` — 拷二进制和写 `/etc/wukong_ai_build` 必须一起做，见注意事项 9 |
+
+---
+
+## 六点五、⚠️ 这套 BlueZ 代码现在有第二份拷贝
+
+2026-09-01 起，`app/agentic_kit`（agentic-kit 的 `audio_chat_demo`，现为默认开机应用）
+的蓝牙配网**复用了本文档描述的这套落地方案**，文件是**复制**过去的，不是共享的：
+
+| 本仓库 | 拷贝到 |
+|--------|--------|
+| `tuyaos_adapter/src/tuya_gatt.c` / `.h` | `app/agentic_kit/pal/bluez/tuya_gatt.c` / `.h` |
+| `tuyaos_adapter/src/tuya_hci.c` / `.h` | `app/agentic_kit/pal/bluez/tuya_hci.c` / `.h` |
+| `tuyaos_adapter/src/tuya_bluez_def.h` | `app/agentic_kit/pal/bluez/tuya_bluez_def.h` |
+| `tuyaos_adapter/src/gdbus/` | `app/agentic_kit/pal/bluez/gdbus/` |
+| `tuyaos_adapter/src/tuya_bluez_compat.h` | 重写：用 libc 的 malloc/free 顶掉 `tkl_memory.h` |
+
+差别只在上层：wukong 走 `tkl_bluetooth.c` → TuyaOS SDK；agentic_kit 走
+`pal/bluez/tuya_ble_bluez.c` → `modules/tuya-ble` 协议状态机。UUID、广播策略、
+长度类型这些约束两边完全一样，本文第三节列的坑对两边都成立。
+
+**所以：在这里修 `tuya_gatt.c` 或 `tuya_hci.c` 的 bug，记得同步过去，反之亦然。**
+（wukong 当前不开机自启，见 `K98wukong_ai`，但仍可手动启动，两边都还活着。）
+
+有脚本盯着这件事，改完跑一下就知道有没有漏：
+
+```sh
+app/check-bluez-sync.sh
+```
+
+`app/agentic_kit/build_rk3506b.sh` 每次编译会自动跑它（只在漂移时出声）。但**本仓库
+（wukong）的构建不会**——在这边改完 `tuya_gatt.c`，请手工跑一次。
+
+评估过用 `#ifdef` 把两份合成一份，结论是不合适：两边传输层行为一行都不差，没有东西可以
+宏起来，而在 1131 行的 D-Bus 状态机里开分支只会把"两份文件漂移"换成"一份文件里两条路径
+漂移"。终局方案是提成 `app/common/bluez/` 单份共享、两边各自提供 `tuya_bluez_compat.h`，
+等 agentic_kit 侧配网在真机跑通、BlueZ 稳定后再做。
+
+agentic_kit 侧的说明见 `app/agentic_kit/PORTING_RK3506B.md` 第八节。
 
 ---
 
